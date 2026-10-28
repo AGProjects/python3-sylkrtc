@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+
+# Copyright (C) 2026 AG Projects (https://ag-projects.com)
+# Licensed under the GNU General Public License, version 3 or later (see LICENSE).
+
+"""Show the account's private storage on SylkServer: the per-account object store
+(/webrtcgateway/storage/<account>) where the clients keep the contact avatars and the
+PGP key escrow (keys/pgp-private).
+
+    sylk-account                                  the namespaces: objects and size of each, usage and limits
+    sylk-account namespaces                       the same
+    sylk-account list NAMESPACE                   the objects of a namespace (sylk-account list avatars)
+    sylk-account NAMESPACE                        the same (sylk-account keys)
+    sylk-account devices                          the devices that used the account: first and last use,
+                                                  with the IP address (* this one); forget one with
+                                                  sylk-account delete devices ID
+    sylk-account get NAMESPACE ID [-o FILE]       one object: text and JSON are printed, anything else
+                                                  needs -o (- for stdout)
+    sylk-account delete NAMESPACE ID [-y]         remove one object (asks first, unless -y). Only the
+                                                  version just shown is removed: if another device
+                                                  replaced it meanwhile, nothing is (412)
+
+The other devices are told of a delete (application/sylk-storage-changed), as of any change.
+
+The storage is reached over HTTPS with the account's API token. The gateway does not give
+that token to a WebSocket client, so it is taken from a client that keeps it (Blink:
+~/.blink/config, sms.history_synchronization_token), or given with --token. The server is
+found by the SylkServer discovery of the account's domain (cached in ~/.sylkclient/sylkserver).
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+import urllib.parse
+
+from sylkrtc.cli import human_bytes
+from sylkrtc.serverapi import ServerAPI
+
+
+log = logging.getLogger('sylk-account')
+
+PROGRAM = 'sylk-account'
+
+
+def writer(name, device_id):
+    """Who wrote an object: its device name, else (objects written before names were kept) a short id."""
+    if name:
+        return urllib.parse.unquote(name)
+    return f'device {device_id[:8]}' if device_id else '-'
+
+COMMANDS = {(): 'namespaces', ('namespaces',): 'namespaces', ('list',): 'list', ('get',): 'get', ('delete',): 'delete',
+            ('devices',): 'devices'}
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Show the account\'s private storage on SylkServer (avatars, key escrow).',
+                                     formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split('\n\n', 1)[1])
+    parser.add_argument('command', nargs='*', help='what to do (see below); default: the namespaces')
+    parser.add_argument('-d', '--config-dir', help='the folder whose config file holds the account (default: ~/.sylkclient/, else ~/.sipclient/ or ~/.blink/)')
+    parser.add_argument('-a', '--account', help='the account (default: the default account)')
+    parser.add_argument('--token', help='the API token (default: the one a client keeps for the account)')
+    parser.add_argument('-o', '--output', metavar='FILE', help='get: write the object to FILE (- for stdout)')
+    parser.add_argument('-s', '--sort', choices=('id', 'modified', 'size'), default='id', help='list: the order (default id)')
+    parser.add_argument('-y', '--yes', action='store_true', help='delete: do not ask')
+    parser.add_argument('-j', '--json', action='store_true', help='print the server\'s answer as it is')
+    parser.add_argument('-v', '--verbose', '--debug', dest='debug', action='store_true', help='log debug messages')
+    arguments = parser.parse_intermixed_args()
+    words = list(arguments.command)
+    for size in (1, 0):
+        key = tuple(word.lower() for word in words[:size])
+        if key in COMMANDS:
+            arguments.action, arguments.args = COMMANDS[key], words[size:]
+            break
+    if len(words) == 1 and tuple(word.lower() for word in words) not in COMMANDS:
+        arguments.action, arguments.args = 'list', words        # sylk-account avatars: the objects of a namespace
+    wanted = {'namespaces': 0, 'list': 1, 'get': 2, 'delete': 2, 'devices': 0}[arguments.action]
+    if len(arguments.args) != wanted:
+        parser.error({'namespaces': 'namespaces takes no argument', 'list': 'usage: sylk-account list NAMESPACE',
+                      'get': 'usage: sylk-account get NAMESPACE ID [-o FILE]',
+                      'delete': 'usage: sylk-account delete NAMESPACE ID [-y]',
+                      'devices': 'devices takes no argument'}[arguments.action])
+    return arguments
+
+
+# The server
+
+class Storage(object):
+    """The account storage: requests below /webrtcgateway/storage/<account>."""
+
+    def __init__(self, api):
+        self.api = api
+        self.path = f'storage/{api.quoted_account}'
+        self.url = api.url(self.path)
+
+    def request(self, method, path='', allow=(), **kw):
+        return self.api.request(method, self.path + ('/' + path if path else ''), allow=allow, **kw)
+
+
+# Showing
+
+def when(ms):
+    if not ms:
+        return '-'
+    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(ms) / 1000))
+
+
+def table(header, rows):
+    widths = [max(len(str(cell)) for cell in column) for column in zip(header, *rows)] if rows else [len(cell) for cell in header]
+    line = lambda cells: '  '.join(str(cell).ljust(width) for cell, width in zip(cells, widths)).rstrip()
+    print(line(header))
+    print(line('-' * width for width in widths))
+    for row in rows:
+        print(line(row))
+
+
+def show_namespaces(storage, as_json):
+    data = storage.request('GET').json()
+    if as_json:
+        print(json.dumps(data, indent=2))
+        return
+    print(f'Storage of {data.get("account")} at {storage.url}\n')
+    namespaces = data.get('namespaces') or []
+    if namespaces:
+        table(('Namespace', 'Objects', 'Size'),
+              [(item['namespace'], item['objects'], human_bytes(item['size'])) for item in namespaces])
+    else:
+        print('Nothing stored')
+    usage, limits = data.get('usage') or {}, data.get('limits') or {}
+    print(f'\nUsed {human_bytes(usage.get("size", 0))} of {human_bytes(limits.get("max_account_size", 0))}, '
+          f'{usage.get("objects", 0)} of {limits.get("max_objects", 0)} objects, '
+          f'at most {human_bytes(limits.get("max_object_size", 0))} each')
+
+
+def show_list(storage, namespace, sort, as_json):
+    data = storage.request('GET', urllib.parse.quote(namespace, safe='')).json()
+    if as_json:
+        print(json.dumps(data, indent=2))
+        return
+    objects = data.get('objects') or []
+    key = {'id': lambda item: item.get('id') or '',
+           'modified': lambda item: item.get('modified') or 0,
+           'size': lambda item: item.get('size') or 0}[sort]
+    objects.sort(key=key)
+    print(f'{namespace}: {len(objects)} object(s), {human_bytes(sum(item.get("size") or 0 for item in objects))}\n')
+    if objects:
+        table(('Id', 'Size', 'Type', 'Modified', 'Written by', 'ETag'),
+              [(item.get('id'), human_bytes(item.get('size') or 0), item.get('content_type') or '-', when(item.get('modified')),
+                writer(item.get('device_name'), item.get('device_id')), (item.get('etag') or '-')[:12]) for item in objects])
+
+
+def show_object(storage, namespace, object_id, output):
+    response = storage.request('GET', object_path(namespace, object_id))
+    content_type = response.headers.get('Content-Type') or 'application/octet-stream'
+    data = response.content
+    if output and output != '-':
+        with open(output, 'wb') as file:
+            file.write(data)
+        print(f'{namespace}/{object_id}: {len(data)} bytes, {content_type}, written to {output}')
+        return
+    if output == '-':
+        sys.stdout.buffer.write(data)
+        return
+    textual = content_type.startswith('text/') or content_type in ('application/json', 'application/pgp-encrypted')
+    if not textual:
+        raise SystemExit(f'{namespace}/{object_id} is {content_type} ({len(data)} bytes): give -o FILE')
+    text = data.decode('utf-8', 'replace')
+    record = None
+    if content_type == 'application/json':
+        try:
+            record = json.loads(text)
+            text = json.dumps(record, indent=2)
+        except ValueError:
+            pass
+    print(f'{namespace}/{object_id}: {len(data)} bytes, {content_type}, ETag {response.headers.get("ETag", "-")}')
+    print(f'Stored by {writer(response.headers.get("X-Sylk-Device-Name"), response.headers.get("X-Sylk-Device-Id"))}')
+    if (namespace, object_id) == ('keys', 'pgp-private') and isinstance(record, dict):
+        # the key escrow says itself which device escrowed the key, and when
+        print(f'Key escrowed by "{record.get("device") or "?"}" at {record.get("timestamp") or "?"}')
+    print()
+    print(text)
+
+
+def show_devices(storage, as_json):
+    listing = storage.request('GET', 'devices').json()
+    devices = []
+    for item in listing.get('objects') or []:
+        try:
+            entry = storage.request('GET', object_path('devices', item['id'])).json() or {}
+        except (SystemExit, ValueError) as e:
+            entry = {'error': str(e)}
+        entry['id'] = item['id']
+        devices.append(entry)
+    devices.sort(key=lambda entry: entry.get('last_seen') or 0, reverse=True)
+    if as_json:
+        print(json.dumps(devices, indent=2))
+        return
+    print(f'{len(devices)} device(s) used {listing.get("account")}, the most recent first\n')
+    own = storage.api.device_id
+    for entry in devices:
+        mine = entry.get('device_id') == own or entry['id'] == own
+        title = entry.get('device_name') or entry.get('user_agent') or entry['id']
+        print(f'{title}{"   (this one)" if mine else ""}')
+        rows = [('Last used', f'{when(entry.get("last_seen"))}  {ago(entry.get("last_seen"))}'),
+                ('', f'from {entry.get("last_ip") or "?"} over {entry.get("last_via") or "?"}'),
+                ('First used', f'{when(entry.get("first_seen"))}  from {entry.get("first_ip") or "?"}')]
+        if entry.get('user_agent') and entry.get('user_agent') != title:
+            rows.append(('Client', entry['user_agent']))
+        rows.append(('Id', entry['id'] + ('   (did not say which device it is)' if entry['id'].startswith('ua-') else '')))
+        if entry.get('error'):
+            rows.append(('Error', entry['error']))
+        for label, value in rows:
+            print(f'    {label:<11} {value}')
+        print()
+    print('Forget a device: sylk-account delete devices ID')
+
+
+def ago(ms):
+    """How long ago, for a human: just now, 5 minutes ago, 3 hours ago, 2 days ago."""
+    if not ms:
+        return ''
+    seconds = max(0, time.time() - int(ms) / 1000)
+    for unit, size in (('day', 86400), ('hour', 3600), ('minute', 60)):
+        if seconds >= size:
+            count = int(seconds // size)
+            return f'({count} {unit}{"s" if count > 1 else ""} ago)'
+    return '(just now)'
+
+
+def object_path(namespace, object_id):
+    return f'{urllib.parse.quote(namespace, safe="")}/{urllib.parse.quote(object_id, safe="")}'
+
+
+def delete_object(storage, namespace, object_id, yes):
+    path = object_path(namespace, object_id)
+    response = storage.request('HEAD', path, allow=(404,))
+    if response.status_code == 404:
+        raise SystemExit(f'{namespace}/{object_id}: not stored')
+    etag = response.headers.get('ETag')
+    device = writer(response.headers.get('X-Sylk-Device-Name'), response.headers.get('X-Sylk-Device-Id'))
+    print(f'{namespace}/{object_id}: {response.headers.get("Content-Type", "-")}, ETag {etag}, stored by {device}')
+    if not yes:
+        try:
+            answer = input('Delete it? It cannot be restored. [y/N] ')
+        except EOFError:
+            answer = ''
+        if answer.strip().lower() not in ('y', 'yes'):
+            raise SystemExit('not deleted')
+    response = storage.request('DELETE', path, headers={'If-Match': etag},
+                               allow=(404, 412))
+    if response.status_code == 412:
+        raise SystemExit(f'{namespace}/{object_id} was replaced meanwhile by another device: not deleted (show it again)')
+    if response.status_code == 404:
+        raise SystemExit(f'{namespace}/{object_id}: already gone')
+    print(f'{namespace}/{object_id} deleted')
+
+
+def main():
+    arguments = parse_arguments()
+    logging.basicConfig(format='%(name)s: %(message)s')       # a no-op where the SDK's log handler is installed
+    logging.getLogger().setLevel(logging.DEBUG if arguments.debug else logging.WARNING)
+    storage = Storage(ServerAPI.connect(PROGRAM, arguments.account, arguments.config_dir, arguments.token))
+    if arguments.action == 'namespaces':
+        show_namespaces(storage, arguments.json)
+    elif arguments.action == 'list':
+        show_list(storage, arguments.args[0], arguments.sort, arguments.json)
+    elif arguments.action == 'get':
+        show_object(storage, arguments.args[0], arguments.args[1], arguments.output)
+    elif arguments.action == 'devices':
+        show_devices(storage, arguments.json)
+    elif arguments.action == 'delete':
+        delete_object(storage, arguments.args[0], arguments.args[1], arguments.yes)
+
+
+if __name__ == '__main__':
+    main()

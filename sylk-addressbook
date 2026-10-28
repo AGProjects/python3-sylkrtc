@@ -1,0 +1,679 @@
+#!/usr/bin/env python3
+
+# Copyright (C) 2026 AG Projects (https://ag-projects.com)
+# Licensed under the GNU General Public License, version 3 or later (see LICENSE).
+
+"""Show and change the account's addressbook: the one SylkServer keeps (XCAP) and Sylk Mobile,
+sylk-desktop and Blink share, through the WebRTC gateway. It is cached in
+~/.sylkclient/addressbook/<account>.json: showing it does not connect, unless there is no
+cache yet or -f is given; a change fetches it anew first, then sends the change.
+
+    sylk-addressbook                                  the contacts, then the groups (fetched once, then cached)
+    sylk-addressbook -f                               fetched anew
+    sylk-addressbook contacts [TEXT]                  the contacts (whose name or address has TEXT)
+    sylk-addressbook groups                           the groups and the names of their contacts
+    sylk-addressbook policies
+    sylk-addressbook show CONTACT|GROUP               everything about one
+    sylk-addressbook show -c [CONTACT]                the contacts, or one contact
+    sylk-addressbook show -g [GROUP]                  the groups (with their number of contacts), or one group and its contacts
+    sylk-addressbook --check                          what Blink (Cocoa, Qt) and Sylk Mobile would repair, and where they disagree
+
+    sylk-addressbook contact add NAME URI [URI...]    URI: user (the account's domain), user@domain, a number,
+                                                      or TYPE=URI (mobile=+31612345678)
+    sylk-addressbook contact rename CONTACT NAME
+    sylk-addressbook contact add-uri CONTACT URI
+    sylk-addressbook contact remove-uri CONTACT URI
+    sylk-addressbook contact delete CONTACT
+
+    sylk-addressbook group add NAME
+    sylk-addressbook group rename GROUP NAME
+    sylk-addressbook group add-contact GROUP CONTACT [CONTACT...]
+    sylk-addressbook group remove-contact GROUP CONTACT [CONTACT...]
+    sylk-addressbook group delete GROUP               (its contacts stay)
+
+CONTACT and GROUP: an id, a name, a unique part of a name, or for a contact one of its addresses
+(delete takes no part of a name: the whole name, an address or the id).
+The gateway only gives the addressbook to a registered account: it is registered while connected.
+"""
+
+import argparse
+import logging
+import os
+import textwrap
+import time
+
+from application.notification import IObserver, NotificationCenter
+from application.python import Null
+from twisted.internet import reactor
+from zope.interface import implementer
+
+from sylkrtc import sipconfig
+from sylkrtc import addressbook_check
+from sylkrtc.addressbook import AddressBook, AmbiguousError, contact_uris, for_server, new_contact, new_group, new_id, normalize_uri, uri_type
+from sylkrtc.call import Account
+from sylkrtc.cli import setup_logging
+from sylkrtc.discovery import Discovery
+from sylkrtc.rooms import RoomTarget
+from sylkrtc.videoroom import Identity
+
+
+log = logging.getLogger('sylk-addressbook')
+
+from sylkrtc.device import USER_AGENT     # one device for all the tools (sylkrtc.device)
+TIMEOUT = 30        # s for the whole exchange with the server
+
+COMMANDS = {
+    (): 'list', ('list',): 'list', ('contacts',): 'contacts', ('groups',): 'groups', ('policies',): 'policies', ('show',): 'show',
+    ('fetch',): 'fetch',
+    ('contact', 'add'): 'contact_add', ('contact', 'rename'): 'contact_rename', ('contact', 'add-uri'): 'contact_add_uri',
+    ('contact', 'remove-uri'): 'contact_remove_uri', ('contact', 'delete'): 'contact_delete',
+    ('group', 'add'): 'group_add', ('group', 'rename'): 'group_rename', ('group', 'add-contact'): 'group_add_contact',
+    ('group', 'remove-contact'): 'group_remove_contact', ('group', 'delete'): 'group_delete',
+}
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Show and change the account\'s addressbook (SylkServer, shared with Sylk Mobile and Blink).',
+                                     formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split('\n\n', 1)[1])
+    parser.add_argument('command', nargs='*', help='what to do (see below); default: list the contacts and the groups')
+    parser.add_argument('-d', '--config-dir', help='the folder whose config file holds the account (default: ~/.sylkclient/, else ~/.sipclient/ or ~/.blink/)')
+    parser.add_argument('-a', '--account', help='the account (default: the default account)')
+    parser.add_argument('-c', '--contacts', action='store_true', help='show: the contacts (all, or the one named)')
+    parser.add_argument('-g', '--groups', action='store_true', help='show: the groups (all, or the one named)')
+    parser.add_argument('-s', '--sort', choices=('id', 'name', 'uri'), default='id',
+                        help='the order of the lists: id (the default), name, or for contacts uri (groups have none: by id)')
+    parser.add_argument('-f', '--fetch', action='store_true', help='fetch the addressbook from the server, not only the cache')
+    parser.add_argument('-i', '--ids', action='store_true', help='show the ids of the policies (contacts and groups always show theirs)')
+    parser.add_argument('--check', action='store_true',
+                        help='show what Blink (Cocoa, Qt) and Sylk Mobile would repair in the addressbook, and where they disagree; changes nothing')
+    parser.add_argument('--conference-domain', action='append', default=[], metavar='DOMAIN',
+                        help='check: a conference server domain (repeat for more; default conference.sip2sip.info, the first is the one mobile knows)')
+    parser.add_argument('--replace-leading-zero', metavar='PREFIX', help='check: the dial plan replaces a leading 0 with PREFIX (e.g. 0031)')
+    parser.add_argument('--idd-prefix', metavar='PREFIX', help='check: the dial plan\'s international access code (default 00)')
+    parser.add_argument('-v', '--verbose', '--debug', dest='debug', action='store_true', help='log debug messages')
+    parser.add_argument('-t', '--trace', action='store_true', help='log the sylkRTC messages')
+    arguments = parser.parse_intermixed_args()     # options anywhere: show -g work, show work -g
+    words = list(arguments.command)
+    for size in (2, 1, 0):
+        key = tuple(word.lower() for word in words[:size])
+        if key in COMMANDS:
+            arguments.action, arguments.args = COMMANDS[key], words[size:]
+            break
+    else:
+        parser.error(f'unknown command: {" ".join(words)}')
+    return arguments
+
+
+# Showing
+
+def uri_entries(contact):
+    """[(address, type)]; type '-' when there is none."""
+    return [(uri['uri'], uri.get('type') or '-') for uri in contact.get('uris') or [] if uri.get('uri')]
+
+
+def uri_texts(contact):
+    return [uri for uri, kind in uri_entries(contact)]
+
+
+def default_entry(contact):
+    """(the default address, its type)."""
+    address = default_uri(contact)
+    kind = next((uri.get('type') for uri in contact.get('uris') or [] if uri.get('uri') == address), None)
+    return (address or '-', kind or '-')
+
+
+def uris_text(contact):
+    texts = []
+    for uri in contact.get('uris') or []:
+        if not uri.get('uri'):
+            continue
+        text = uri['uri']
+        if uri.get('type') and uri['type'].lower() not in ('sip', ''):
+            text = f'{text} ({uri["type"]})'         # the type is not part of the address
+        texts.append(text)
+    return ', '.join(texts) or '-'
+
+
+def default_uri(contact):
+    """The contact's default address: its defaultUri, the uri marked default, else the first."""
+    if isinstance(contact.get('defaultUri'), dict) and contact['defaultUri'].get('uri'):
+        return contact['defaultUri']['uri']
+    uris = [uri for uri in contact.get('uris') or [] if uri.get('uri')]
+    marked = [uri for uri in uris if uri.get('default')]
+    return (marked or uris or [{}])[0].get('uri')
+
+
+def name_of(item, ids=False):
+    name = item.get('name') or '(no name)'
+    return f'{name} [{item.get("id")}]' if ids else name
+
+
+def show_header(book):
+    when = time.strftime('%Y-%m-%d %H:%M', time.localtime(book.fetched)) if book.fetched else 'never'
+    print(f'Addressbook of {book.account_id}, fetched {when} ({book.path})')
+
+
+SORT = 'id'        # --sort: id, name, or for contacts uri
+
+
+def sort_key(item):
+    if SORT == 'name':
+        return ((item.get('name') or '').lower(), item.get('id') or '')
+    if SORT == 'uri' and 'uris' in item:
+        return ((uri_texts(item) or [''])[0].lower(), item.get('id') or '')
+    return (item.get('id') or '',)          # the built-in groups (_blocked, _calls ...) first
+
+
+def show_groups(book, ids, members=True, groups=None, title=None):
+    groups = book.groups if groups is None else groups
+    count = len(groups)
+    print(f'\n{count or "No"} group{"" if count == 1 else "s"}' + (title or ''))
+    if not count:
+        return
+    print()
+    groups = sorted(groups, key=sort_key)
+    if not groups:
+        return
+    rows = [(group.get('id') or '?', group.get('name') or '(no name)', book.members(group)) for group in groups]
+    id_width = max([len(row[0]) for row in rows] + [len('Id')])
+    name_width = max([len(row[1]) for row in rows] + [len('Name')])
+    count_width = max([len(str(len(row[2]))) for row in rows] + [len('Contacts')])
+    number = len(str(len(rows)))
+    print(f'  {"":>{number}}  {"Id":<{id_width}}  {"Name":<{name_width}}  {"Contacts":>{count_width}}' + ('  Members' if members else ''))
+    print(f'  {"":>{number}}  {"-" * id_width}  {"-" * name_width}  {"-" * count_width}' + ('  -------' if members else ''))
+    for index, (group_id, name, contacts) in enumerate(rows, 1):
+        names = ', '.join(sorted((member.get('name') or member.get('id') or '?') for member in contacts)) if members else ''
+        print(f'  {index:>{number}}  {group_id:<{id_width}}  {name:<{name_width}}  {len(contacts):>{count_width}}' + (f'  {names}' if names else ''))
+
+
+def show_contacts(book, ids, text=None, contacts=None, title=None, one_line=False):
+    contacts = book.contacts if contacts is None else contacts
+    if text and title is None:
+        lowered = text.lower()
+        contacts = [contact for contact in contacts if lowered in (contact.get('name') or '').lower() or any(lowered in uri.lower() for uri in contact_uris(contact))]
+    count = len(contacts)
+    print(f'\n{count or "No"} contact{"" if count == 1 else "s"}' + (title if title is not None else f' of {len(book.contacts)} with {text!r}' if text else ''))
+    if not count:
+        return
+    print()
+    rows = []
+    for contact in sorted(contacts, key=sort_key):
+        groups = ', '.join(group.get('name') or '?' for group in book.groups_of(contact))
+        uris = [default_entry(contact)] if one_line else uri_entries(contact) or [('-', '-')]      # one_line: the default address only
+        rows.append((contact.get('id') or '?', uris, contact.get('name') or '(no name)', groups))
+    id_width = max([len(row[0]) for row in rows] + [len('Id')])
+    uri_width = max([len(uri) for row in rows for uri, kind in row[1]] + [len('URI')])
+    type_width = max([len(kind) for row in rows for uri, kind in row[1]] + [len('Type')])
+    name_width = max([len(row[2]) for row in rows] + [len('Display name')])
+    groups_width = max([len(row[3]) for row in rows] + [len('Groups')])
+    number = len(str(len(rows)))
+    print(f'  {"":>{number}}  {"Id":<{id_width}}  {"URI":<{uri_width}}  {"Type":<{type_width}}  {"Display name":<{name_width}}  Groups')
+    print(f'  {"":>{number}}  {"-" * id_width}  {"-" * uri_width}  {"-" * type_width}  {"-" * name_width}  {"-" * groups_width}')
+    for index, (contact_id, uris, name, groups) in enumerate(rows, 1):
+        (uri, kind), more = uris[0], uris[1:]
+        print(f'  {index:>{number}}  {contact_id:<{id_width}}  {uri:<{uri_width}}  {kind:<{type_width}}  {name:<{name_width}}  {groups}'.rstrip())
+        for uri, kind in more:        # one line per address
+            print(f'  {"":>{number}}  {"":<{id_width}}  {uri:<{uri_width}}  {kind}')
+
+
+def show_policies(book, ids):
+    count = len(book.policies)
+    print(f'\n{count or "No"} polic{"y" if count == 1 else "ies"}')
+    if not count:
+        return
+    print()
+    for policy in book.policies:
+        presence, dialog = policy.get('presence') or {}, policy.get('dialog') or {}
+        print(f'  {policy.get("uri") or "?"}' + (f' [{policy.get("id")}]' if ids else '') +
+              f'  presence {presence.get("policy", "default")}, dialog {dialog.get("policy", "default")}' + (f'  ({policy["name"]})' if policy.get('name') else ''))
+
+
+def show_item(book, text, kind=None):
+    """The contact or group named text; when it is not unique, a list of the matches, as the filter of contacts TEXT."""
+    try:
+        if kind is not None:
+            items = [book.find(kind, text)]
+        else:
+            try:
+                items, kind = [book.find('contact', text)], 'contact'
+            except AmbiguousError:
+                raise
+            except LookupError:
+                items, kind = [book.find('group', text)], 'group'
+    except AmbiguousError as error:           # several: list them, as a filter would
+        kind = kind or 'contact'
+        title = f' match {text!r}'
+        if kind == 'contact':
+            lowered = text.lower()
+            found = {contact.get('id') for contact in error.items}
+            matches = [contact for contact in book.contacts if contact.get('id') in found or lowered in (contact.get('name') or '').lower()
+                       or any(lowered in uri.lower() for uri in contact_uris(contact))]
+            show_contacts(book, True, contacts=matches, title=title, one_line=True)
+        else:
+            show_groups(book, True, members=False, groups=error.items, title=title)
+        return
+    for item in items:
+        show_one(book, item, kind)
+
+
+def show_one(book, item, kind):
+    print(f'{kind} {item.get("name")!r}')
+    print(f'  id          {item.get("id")}')
+    attributes = sorted((item.get('attributes') or {}).items())
+    if attributes:
+        print('  Attributes')
+        print()
+        width = max(len(key) for key, value in attributes)
+        for key, value in attributes:
+            print(f'    {key:<{width}}  {value}')
+    print()
+    if kind == 'contact':
+        for uri in item.get('uris') or []:
+            print(f'  uri         {uri.get("uri")}' + (f' ({uri["type"]})' if uri.get('type') else '') + (' default' if uri.get('default') else ''))
+        for event in ('presence', 'dialog'):
+            handling = item.get(event) or {}
+            print(f'  {event:<11} policy {handling.get("policy", "default")}, subscribe {"yes" if handling.get("subscribe") else "no"}')
+        print(f'  default     {default_uri(item) or "none"}')
+        print(f'  groups      {", ".join(group.get("name") or "?" for group in book.groups_of(item)) or "none"}')
+    else:
+        members = sorted(book.members(item), key=sort_key)
+        print(f'  {len(members) or "no"} contact{"" if len(members) == 1 else "s"}')
+        if members:
+            print()
+        rows = [(member.get('id') or '?',) + default_entry(member) + (member.get('name') or '?',) for member in members]
+        widths = [max([len(row[column]) for row in rows] + [len(title)]) for column, title in ((0, 'Id'), (1, 'URI'), (2, 'Type'))]
+        number = len(str(len(rows)))
+        if rows:
+            name_width = max([len(row[3]) for row in rows] + [len('Display name')])
+            print(f'    {"":>{number}}  {"Id":<{widths[0]}}  {"URI":<{widths[1]}}  {"Type":<{widths[2]}}  Display name')
+            print(f'    {"":>{number}}  {"-" * widths[0]}  {"-" * widths[1]}  {"-" * widths[2]}  {"-" * name_width}')
+        for index, (contact_id, uri, kind, name) in enumerate(rows, 1):
+            print(f'    {index:>{number}}  {contact_id:<{widths[0]}}  {uri:<{widths[1]}}  {kind:<{widths[2]}}  {name}')
+    if item.get('avatar'):
+        print(f'  avatar      {item["avatar"].get("contentType") or "yes"}')
+
+
+def show_check(book, context):
+    findings = addressbook_check.check(book, context)
+    clients = addressbook_check.CLIENTS
+    names = addressbook_check.CLIENT_NAMES
+    print(f'\nChecked {len(book.contacts)} contacts, {len(book.groups)} groups, {len(book.policies)} policies '
+          f'with the rules of {", ".join(names[client] for client in clients)} (conference {", ".join(sorted(context.conference_domains))}'
+          + (f', leading 0 -> {context.replace_leading_zero}' if context.replace_leading_zero else '') + '); nothing was changed')
+    by_rule = {}
+    for finding in findings:
+        by_rule.setdefault(finding.rule, []).append(finding)
+    print('\nRules')
+    print()
+    rules = addressbook_check.RULES
+    name_width = max(len(rule) for rule in rules)
+    number = {rule: index for index, rule in enumerate(rules, 1)}       # R1, R2 ...: the order of the rules
+    number_width = len(f'R{len(rules)}')
+    results = {}
+    for rule in rules:
+        items = by_rule.get(rule, [])
+        conflicts = sum(1 for finding in items if finding.disagrees)
+        results[rule] = 'pass' if not items else f'{len(items)}' + (f' ({conflicts} !)' if conflicts else '')
+    result_width = max([len(result) for result in results.values()] + [len('Result')])
+    print('  Result: pass, or the number of findings (of which where the clients disagree, !)')
+    print()
+    print(f'  {"#":<{number_width}}  {"Rule":<{name_width}}  {"Result":<{result_width}}  Checks')
+    print(f'  {"-" * number_width}  {"-" * name_width}  {"-" * result_width}  ------')
+    for rule in rules:
+        print(f'  {"R" + str(number[rule]):<{number_width}}  {rule:<{name_width}}  {results[rule]:<{result_width}}  {addressbook_check.DESCRIPTIONS[rule]}')
+    if not findings:
+        print('\nNothing to repair, nothing to ask.')
+        return
+    disagreeing = []
+    width = max([len(names[client]) for client in clients] + [len('Wanted')])
+    for rule, (title, behaviour) in addressbook_check.RULES.items():
+        items = by_rule.get(rule)
+        if not items:
+            continue
+        conflicts = sum(1 for finding in items if finding.disagrees)
+        if conflicts:
+            disagreeing.append(rule)
+        print(f'\nR{number[rule]} {title} ({rule}): {len(items)}' + (f', the clients disagree on {conflicts}' if conflicts else ''))
+        print()
+        for index, finding in enumerate(items, 1):
+            mark = '!' if finding.disagrees else ' '
+            print(f' {mark}{index:>3}  {finding.subject}')
+            if finding.wanted:
+                print(f'        {"Wanted":<{width}}  {finding.wanted}')
+            if any(finding.actions.values()) or finding.wanted:
+                for client in clients:
+                    print(f'        {names[client]:<{width}}  {finding.actions[client] or "-"}')
+            if finding.note:
+                print(f'        {finding.note}')
+    if disagreeing:
+        print('\nWhat would have to change for the clients to agree (where they disagree, !)')
+        for client in clients:
+            print(f'\n{names[client]}')
+            print()
+            changes = [(f'R{number[rule]} {addressbook_check.RULES[rule][0]} ({rule})',) + addressbook_check.RULES[rule][1][client] for rule in disagreeing]
+            changes = [(title, does, change) for title, does, change in changes if change]
+            if not changes:
+                print('  nothing')
+            for title, does, change in changes:
+                print(f'  {title}')
+                print(textwrap.fill(does, width=110, initial_indent='    now:    ', subsequent_indent='            '))
+                print(textwrap.fill(change, width=110, initial_indent='    change: ', subsequent_indent='            '))
+    total = sum(1 for finding in findings if finding.disagrees)
+    print(f'\n{len(findings)} finding{"" if len(findings) == 1 else "s"}, {total} where the clients disagree')
+
+
+def refuse_lan(text):
+    """XCAP is shared between devices: a Bonjour address or one on a LAN host works on one LAN only."""
+    host = addressbook_check.lan_host(text.partition('=')[2] if '=' in text.partition('@')[0] else text)
+    if host:
+        what = host if host.startswith('a Bonjour') else f'{host} is a LAN host'
+        raise SystemExit(f'{text}: {what}, reachable from one network only; the addressbook is shared, it is not stored')
+
+
+# The server
+
+@implementer(IObserver)
+class AddressBookClient(object):
+    """Connects, registers, fetches the addressbook, sends the changes, then calls done(error)."""
+
+    def __init__(self, account_info, config_dir, verify_tls, book, changes, done):
+        self.account_info = account_info
+        self.config_dir = config_dir
+        self.verify_tls = verify_tls
+        self.book = book
+        self.changes = changes          # [callable(book) -> (action, kind, data, description) or None]
+        self.done = done
+        self.account = None
+        self.failed = None
+        self._timer = None
+
+    def start(self):
+        self._timer = reactor.callLater(TIMEOUT, self.finish, 'no answer from the server')
+        discovery = Discovery(os.path.join(sipconfig.DEFAULT_DIRECTORY, 'sylkserver'))
+        discovery.discover(self.account_info.domain).addCallback(self._configured)
+
+    def _configured(self, configuration):
+        if not configuration or not configuration.get('wsServer'):
+            self.finish(f'{self.account_info.domain} publishes no SylkServer configuration with a wsServer')
+            return
+        server = RoomTarget('room', self.account_info.domain, configuration)
+        identity = Identity.from_credentials(self.account_info.id, self.account_info.password, self.account_info.display_name,
+                                             auth_username=self.account_info.auth_username, instance_id=self.account_info.instance_id)
+        self.account = Account(identity, server.ws_server, user_agent=USER_AGENT, verify_tls=self.verify_tls)
+        NotificationCenter().add_observer(self, sender=self.account)
+        log.info(f'registering {self.account_info.id} at {server.ws_server}')
+        self.account.register()
+
+    def handle_notification(self, notification):
+        handler = getattr(self, '_NH_%s' % notification.name, Null)
+        handler(notification)
+
+    def _NH_SylkRTCAccountRegistrationDidChange(self, notification):
+        state = notification.data.state
+        if state == 'registered' and not getattr(self, '_fetching', False):
+            self._fetching = True
+            log.info('fetching the addressbook')
+            self.account.fetch_addressbook(self._fetched)
+        elif state == 'failed':
+            self.finish(f'registration failed: {notification.data.reason}')
+
+    def _fetched(self, addressbook, error):
+        if error is not None:
+            self.finish(f'cannot fetch the addressbook: {error}')
+            return
+        self.book.replace(addressbook)
+        log.info(f'{len(self.book.contacts)} contacts, {len(self.book.groups)} groups, {len(self.book.policies)} policies')
+        self._next_change()
+
+    def _next_change(self):
+        while self.changes:
+            change = self.changes.pop(0)
+            try:
+                request = change(self.book)
+            except LookupError as e:
+                self.finish(str(e))
+                return
+            if request is None:
+                continue
+            action, kind, data, description = request
+            self._description = description
+            self.account.update_addressbook(action, kind, for_server(data), lambda result, error, action=action, kind=kind: self._updated(action, kind, result, error))
+            return
+        self.finish(None)
+
+    def _updated(self, action, kind, result, error):
+        if error is not None:
+            self.finish(f'{self._description}: {error}')
+            return
+        self.book.apply(kind, action, result)
+        print(f'* {self._description}')
+        self._next_change()
+
+    def finish(self, error):
+        if self._timer is not None and self._timer.active():
+            self._timer.cancel()
+        self._timer = None
+        if self.account is not None:
+            NotificationCenter().discard_observer(self, sender=self.account)
+            account, self.account = self.account, None
+            account.close()
+        done, self.done = self.done, None
+        if done is not None:
+            reactor.callLater(0.5, done, error)       # the unregister and close go out
+
+
+# Changes: each a callable(book) -> (action, kind, data, description) or None, run on the freshly fetched addressbook
+
+def changes_for(arguments, domain):
+    action, args = arguments.action, arguments.args
+
+    def need(count, usage):
+        if len(args) < count:
+            raise SystemExit(f'usage: sylk-addressbook {usage}')
+
+    if action == 'contact_add':
+        need(2, 'contact add NAME URI [URI...]')
+        name, uris = args[0], args[1:]
+        for uri in uris:
+            refuse_lan(uri)
+
+        def change(book):
+            for uri in uris:
+                address = normalize_uri(uri.partition('=')[2] if '=' in uri and '@' not in uri.partition('=')[0] else uri, domain)
+                same = [contact for contact in book.contacts if address.lower() in (text.lower() for text in contact_uris(contact))]
+                if same:
+                    print(f'* note: {address} is already in {", ".join(repr(contact.get("name")) for contact in same)}')
+            contact = new_contact(name, uris, domain)
+            return 'add', 'contact', contact, f'contact {name!r} added ({uris_text(contact)})'
+        return [change]
+
+    if action == 'contact_rename':
+        need(2, 'contact rename CONTACT NAME')
+
+        def change(book):
+            contact = dict(book.find('contact', args[0]))
+            old, contact['name'] = contact.get('name'), args[1]
+            return 'update', 'contact', contact, f'contact {old!r} renamed {args[1]!r}'
+        return [change]
+
+    if action in ('contact_add_uri', 'contact_remove_uri'):
+        need(2, f'contact {"add-uri" if action == "contact_add_uri" else "remove-uri"} CONTACT URI')
+        if action == 'contact_add_uri':
+            refuse_lan(args[1])
+
+        def change(book):
+            contact = dict(book.find('contact', args[0]))
+            uris = [dict(uri) for uri in contact.get('uris') or []]
+            text = args[1]
+            kind, sep, rest = text.partition('=')
+            if sep and kind and '@' not in kind and ':' not in kind:
+                text = rest
+            else:
+                kind = None
+            address = normalize_uri(text, domain)
+            present = [uri for uri in uris if (uri.get('uri') or '').lower() == address.lower()]
+            if action == 'contact_add_uri':
+                if present:
+                    print(f'* {contact.get("name")!r} already has {address}')
+                    return None
+                uris.append(dict(id=new_id(), uri=address, type=uri_type(address, kind)))
+                description = f'{address} added to {contact.get("name")!r}'
+            else:
+                if not present:
+                    raise LookupError(f'{contact.get("name")!r} has no {address} (it has {uris_text(contact)})')
+                uris = [uri for uri in uris if uri not in present]
+                if contact.get('defaultUri') and (contact['defaultUri'].get('uri') or '').lower() == address.lower():
+                    contact.pop('defaultUri')
+                description = f'{address} removed from {contact.get("name")!r}'
+            contact['uris'] = uris
+            return 'update', 'contact', contact, description
+        return [change]
+
+    if action == 'contact_delete':
+        need(1, 'contact delete CONTACT')
+
+        def change(book):
+            contact = book.find('contact', args[0], exact=True)
+            return 'delete', 'contact', dict(id=contact['id'], name=contact.get('name') or ''), f'contact {contact.get("name")!r} deleted'
+        return [change]
+
+    if action == 'group_add':
+        need(1, 'group add NAME')
+
+        def change(book):
+            if any((group.get('name') or '').lower() == args[0].lower() for group in book.groups):
+                raise LookupError(f'there is a group {args[0]!r} already')
+            return 'add', 'group', new_group(args[0]), f'group {args[0]!r} added'
+        return [change]
+
+    if action == 'group_rename':
+        need(2, 'group rename GROUP NAME')
+
+        def change(book):
+            group = dict(book.find('group', args[0]))
+            old, group['name'] = group.get('name'), args[1]
+            return 'update', 'group', group, f'group {old!r} renamed {args[1]!r}'
+        return [change]
+
+    if action in ('group_add_contact', 'group_remove_contact'):
+        need(2, f'group {"add-contact" if action == "group_add_contact" else "remove-contact"} GROUP CONTACT [CONTACT...]')
+
+        def change(book):
+            group = dict(book.find('group', args[0]))
+            members = list(group.get('contacts') or [])
+            member_ids = [member.get('id') if isinstance(member, dict) else member for member in members]
+            names = []
+            for text in args[1:]:
+                contact = book.find('contact', text)
+                if action == 'group_add_contact':
+                    if contact['id'] in member_ids:
+                        print(f'* {contact.get("name")!r} is in {group.get("name")!r} already')
+                        continue
+                    members.append(contact)
+                    member_ids.append(contact['id'])
+                else:
+                    if contact['id'] not in member_ids:
+                        print(f'* {contact.get("name")!r} is not in {group.get("name")!r}')
+                        continue
+                    members = [member for member in members if (member.get('id') if isinstance(member, dict) else member) != contact['id']]
+                    member_ids.remove(contact['id'])
+                names.append(repr(contact.get('name')))
+            if not names:
+                return None
+            # the group's contacts as the addressbook has them now
+            group['contacts'] = [book.contact(member.get('id') if isinstance(member, dict) else member) or member for member in members]
+            verb = 'added to' if action == 'group_add_contact' else 'removed from'
+            return 'update', 'group', group, f'{", ".join(names)} {verb} {group.get("name")!r}'
+        return [change]
+
+    if action == 'group_delete':
+        need(1, 'group delete GROUP')
+
+        def change(book):
+            group = book.find('group', args[0], exact=True)
+            return 'delete', 'group', dict(id=group['id'], name=group.get('name') or ''), f'group {group.get("name")!r} deleted (its contacts stay)'
+        return [change]
+
+    return []
+
+
+def main():
+    global SORT
+    arguments = parse_arguments()
+    SORT = arguments.sort
+    setup_logging(arguments)
+    if not arguments.debug:
+        logging.getLogger().setLevel(logging.WARNING)       # a report: what it prints, warnings and errors
+        logging.getLogger('sylkrtc.connection').setLevel(logging.DEBUG if arguments.trace else logging.WARNING)
+    try:
+        configuration = sipconfig.SylkConfiguration()
+        account_info, config_dir = sipconfig.locate_account(arguments.account, os.path.expanduser(arguments.config_dir) if arguments.config_dir else None)
+    except sipconfig.ConfigError as e:
+        raise SystemExit(str(e))
+    book = AddressBook(account_info.id)
+    book.load()
+    changes = changes_for(arguments, account_info.domain)
+    if arguments.check and changes:
+        raise SystemExit('--check changes nothing: give it without a change')
+    online = bool(changes) or arguments.fetch or arguments.action == 'fetch' or not book.cached
+
+    def show():
+        action, args = arguments.action, arguments.args
+        if arguments.check:
+            show_header(book)
+            context = addressbook_check.Context(account_info.id, arguments.conference_domain,
+                                                arguments.replace_leading_zero, arguments.idd_prefix)
+            show_check(book, context)
+            return
+        if action in ('list', 'fetch'):
+            show_header(book)
+            show_contacts(book, arguments.ids)
+            show_groups(book, arguments.ids, members=False)
+        elif action == 'contacts':
+            show_header(book)
+            show_contacts(book, arguments.ids, ' '.join(args) or None)
+        elif action == 'groups':
+            show_header(book)
+            show_groups(book, arguments.ids)
+        elif action == 'policies':
+            show_header(book)
+            show_policies(book, arguments.ids)
+        elif action == 'show':
+            kind = 'contact' if arguments.contacts else 'group' if arguments.groups else None
+            if not args:
+                if kind is None:
+                    raise SystemExit('usage: sylk-addressbook show [-c|-g] [CONTACT|GROUP]')
+                show_header(book)
+                if kind == 'contact':
+                    show_contacts(book, arguments.ids)
+                else:
+                    show_groups(book, arguments.ids, members=False)
+                return
+            try:
+                show_item(book, ' '.join(args), kind)
+            except LookupError as e:
+                raise SystemExit(str(e))
+
+    if not online:
+        show()
+        return
+    if not account_info.password:
+        raise SystemExit(f'{account_info.id} has no password in {os.path.join(config_dir, "config")}')
+    result = {}
+
+    def done(error):
+        result['error'] = error
+        if reactor.running:
+            reactor.stop()
+
+    client = AddressBookClient(account_info, config_dir, configuration.tls_verify_server, book, changes, done)
+    reactor.callWhenRunning(client.start)
+    reactor.run()
+    if result.get('error'):
+        raise SystemExit(f'sylk-addressbook: {result["error"]}')
+    if not changes:
+        show()
+
+
+if __name__ == '__main__':
+    main()

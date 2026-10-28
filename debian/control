@@ -1,0 +1,48 @@
+Source: python3-sylkrtc
+Section: python
+Priority: optional
+Maintainer: Adrian Georgescu <ag@ag-projects.com>
+Uploaders: Tijmen de Mes <tijmen@ag-projects.com>
+Build-Depends: debhelper (>= 11),
+               dh-python,
+               python3,
+               python3-setuptools
+Standards-Version: 4.5.0
+Homepage: https://ag-projects.com
+X-Python3-Version: >= 3.10
+
+Package: python3-sylkrtc
+Architecture: all
+Depends: ${python3:Depends}, ${misc:Depends},
+         python3-application,
+         python3-autobahn,
+         python3-dnspython,
+         python3-openssl,
+         python3-requests,
+         python3-service-identity,
+         python3-sipsimple,
+         python3-twisted,
+         python3-zope.interface,
+         python3-gi,
+         gir1.2-gstreamer-1.0,
+         gir1.2-gst-plugins-base-1.0,
+         gir1.2-gst-plugins-bad-1.0,
+         gstreamer1.0-plugins-base,
+         gstreamer1.0-plugins-good,
+         gstreamer1.0-plugins-bad,
+         gstreamer1.0-nice
+Recommends: gstreamer1.0-pulseaudio,
+            gstreamer1.0-libav,
+            gstreamer1.0-plugins-ugly,
+            sipclients3
+Description: SylkServer WebRTC gateway client library and tools
+ A client of SylkServer's webrtcgateway (the sylkRTC protocol): domain
+ discovery, video rooms, 1 to 1 calls and the account's addressbook, with
+ GStreamer webrtcbin for the media. No SIP stack is needed.
+ .
+ Tools: sylk-conference joins a video room with audio and chat and publishes
+ local or RTSP (LAN) cameras in it; sylk-session makes and takes 1 to 1 calls;
+ sylk-addressbook shows and changes the account's contacts and groups, shared
+ with Sylk Mobile and Blink; sylk-account shows the account's private storage
+ (avatars, key escrow, devices); sylk-journal summarises its message journal;
+ sylk-settings manages their configuration.

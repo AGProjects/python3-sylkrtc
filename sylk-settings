@@ -1,0 +1,978 @@
+#!/usr/bin/env python3
+
+# Copyright (C) 2026 AG Projects (https://ag-projects.com)
+# Licensed under the GNU General Public License, version 3 or later (see LICENSE).
+
+"""Manage the configuration of sylk-conference and sylk-session, as sip-settings3 does for the SIP SIMPLE clients.
+
+The accounts and general settings are in the SDK's configuration file,
+~/.sylkclient/config (or that of the folder given with -c), read and written with
+the SDK's configuration manager, which keeps the file's structure and indentation.
+The SIP SIMPLE clients (~/.sipclient) and Blink (~/.blink) keep theirs in the same
+format: they are never written here, only their accounts' credentials can be
+imported (--account import).
+
+The general settings, the sessions (what a room is joined with) and the cameras
+(usable by any session) of sylk-conference are in the same file (see sylkrtc.settings).
+"""
+
+import fcntl
+import os
+import re
+import struct
+import sys
+import termios
+
+from collections import deque
+from urllib.parse import urlsplit
+from optparse import OptionParser
+
+from sipsimple.account import Account, BonjourAccount, AccountManager
+from sipsimple.application import SIPApplication
+from sipsimple.configuration import ConfigurationError, ConfigurationManager, DefaultValue, Setting, SettingsGroupMeta
+from sipsimple.configuration.datatypes import List, STUNServerAddress
+from sipsimple.storage import FileStorage
+from sipsimple.threading import ThreadManager
+
+from sylkrtc import sipconfig
+from sylkrtc.settings import SylkSettings, Session, RTSPCamera, LocalCamera, CameraDefaults, sessions, cameras, rtsp_cameras, local_cameras, create, change_id, find_session, find_camera
+
+
+SHOW_PASSWORDS = False
+
+
+def format_child(obj, attrname, maxchars):
+    linebuf = attrname
+    if isinstance(getattr(type(obj), attrname, None), Setting):
+        attr = getattr(obj, attrname)
+        string = str(attr)
+        if attrname == 'password' and attr and not SHOW_PASSWORDS:
+            string = '********'
+        if maxchars is not None:
+            maxchars -= len(attrname)+4
+            if len(string) > maxchars:
+                string = string[:maxchars-3]+'...'
+        linebuf += ' = ' + string
+    return linebuf
+
+def display_object(obj, name):
+    # get terminal width
+    if sys.stdout.isatty():
+        width = struct.unpack('HHHH', fcntl.ioctl(sys.stdout.fileno(), termios.TIOCGWINSZ, struct.pack('HHHH', 0, 0, 0, 0)))[1]
+    else:
+        width = None
+
+    children = deque([child for child in dir(type(obj)) if isinstance(getattr(type(obj), child, None), Setting)] + \
+                     [child for child in dir(type(obj)) if isinstance(getattr(type(obj), child, None), SettingsGroupMeta)])
+    # display first line
+    linebuf = ' '*(len(name)+3) + '+'
+    if children:
+        linebuf += '-- ' + format_child(obj, children.popleft(), width-(len(name)+7) if width is not None else None)
+    print(linebuf)
+    # display second line
+    linebuf = name + ' --|'
+    if children:
+        linebuf += '-- ' + format_child(obj, children.popleft(), width-(len(name)+7) if width is not None else None)
+    print(linebuf)
+    # display the rest of the lines
+    if children:
+        while children:
+            child = children.popleft()
+            linebuf = ' '*(len(name)+3) + ('|' if children else '+') + '-- ' + format_child(obj, child, width-(len(name)+7) if width is not None else None)
+            print(linebuf)
+    else:
+        linebuf = ' '*(len(name)+3) + '+'
+        print(linebuf)
+
+    print()
+
+    [display_object(getattr(obj, child), child) for child in dir(type(obj)) if isinstance(getattr(type(obj), child, None), SettingsGroupMeta)]
+
+def get_section(obj, section):
+    # section may be dotted, e.g. rtp.encryption
+    for part in section.split('.'):
+        if not isinstance(getattr(type(obj), part, None), SettingsGroupMeta):
+            groups = sorted(child for child in dir(type(obj)) if isinstance(getattr(type(obj), child, None), SettingsGroupMeta))
+            raise KeyError('No section %r (available: %s)' % (part, ', '.join(groups) or 'none'))
+        obj = getattr(obj, part)
+    return obj
+
+def show_sections(obj, sections):
+    # sections is a comma separated list, e.g. sip,rtp.encryption
+    for section in (s.strip() for s in sections.split(',')):
+        if not section:
+            continue
+        try:
+            group = get_section(obj, section)
+        except KeyError as e:
+            print(e.args[0])
+            continue
+        display_object(group, section.rsplit('.', 1)[-1])
+
+class SettingsParser(object):
+
+    @classmethod
+    def parse_default(cls, type, value):
+        if issubclass(type, List):
+            values = re.split(r'\s*,\s*', value)
+            return values
+        elif issubclass(type, bool):
+            if value.lower() in ('true', 'yes', 'on', '1'):
+                return True
+            elif value.lower() in ('false', 'no', 'off', '0'):
+                return False
+            raise ValueError('expected true or false, not %s' % value)
+        else:
+            return value
+
+    @classmethod
+    def parse_MSRPRelayAddress(cls, type, value):
+        return type.from_description(value)
+
+    @classmethod
+    def parse_SIPProxyAddress(cls, type, value):
+        return type.from_description(value)
+
+    @classmethod
+    def parse_STUNServerAddress(cls, type, value):
+        return type.from_description(value)
+
+    @classmethod
+    def parse_STUNServerAddressList(cls, type, value):
+        values = re.split(r'\s*,\s*', value)
+        return [STUNServerAddress.from_description(v) for v in values]
+
+    @classmethod
+    def parse_PortRange(cls, type, value):
+        return type(*value.split(':', 1))
+
+    @classmethod
+    def parse_Resolution(cls, type, value):
+        return type(*value.split('x', 1))
+
+    @classmethod
+    def parse_SoundFile(cls, type, value):
+        if ',' in value:
+            path, volume = value.split(',', 1)
+        else:
+            path, volume = value, 100
+        return type(path, volume)
+
+    @classmethod
+    def parse_AccountSoundFile(cls, type, value):
+        if ',' in value:
+            path, volume = value.split(',', 1)
+        else:
+            path, volume = value, 100
+        return type(path, volume)
+
+    @classmethod
+    def parse(cls, type, value):
+        if value == 'None':
+            return None
+        if value == 'DEFAULT':
+            return DefaultValue
+        parser = getattr(cls, 'parse_%s' % type.__name__, cls.parse_default)
+        return parser(type, value)
+
+
+class AccountConfigurator(object):
+    def __init__(self):
+        self.configuration_manager = ConfigurationManager()
+        self.configuration_manager.start()
+        self.account_manager = AccountManager()
+        self.account_manager.load()
+
+    def list(self):
+        print('Accounts:')
+        bonjour_account = BonjourAccount()
+        accounts = [account for account in self.account_manager.get_accounts() if account.id != bonjour_account.id]
+        accounts.sort(key=lambda x: x.id)
+        accounts.append(bonjour_account)
+        for account in accounts:
+            print('  %s (%s)%s' % (account.id, 'enabled' if account.enabled else 'disabled', ' - default_account' if account is self.account_manager.default_account else ''))
+        for directory in sipconfig.SEARCH_DIRECTORIES[1:]:
+            try:
+                others, default = sipconfig.accounts(directory)
+            except sipconfig.ConfigError:
+                continue
+            others = [other for other in others if other.password]
+            if others:
+                print('Credentials the sylk clients can use from %s (read only, sylk-settings --account import copies them):' % os.path.join(directory, 'config'))
+                for other in others:
+                    print('  %s (%s)%s' % (other.id, 'enabled' if other.enabled else 'disabled', ' - default_account' if other.id == default else ''))
+
+    def add(self, sip_address, password):
+        if self.account_manager.has_account(sip_address):
+            print('Account %s already exists' % sip_address)
+            return
+        try:
+            account = Account(sip_address)
+        except ValueError as e:
+            print('Cannot add SIP account: %s' % str(e))
+            return
+        account.auth.password = password
+        account.enabled = True
+        account.save()
+        print('Account added')
+
+    def delete(self, sip_address):
+        if sip_address != 'ALL':
+            possible_accounts = [account for account in self.account_manager.iter_accounts() if sip_address in account.id]
+            if len(possible_accounts) > 1:
+                print("More than one account exists which matches %s: %s" % (sip_address, ", ".join(sorted(account.id for account in possible_accounts))))
+                return
+            if len(possible_accounts) == 0:
+                print('Account %s does not exist' % sip_address)
+                return
+            account = possible_accounts[0]
+            if account == BonjourAccount():
+                print('Cannot delete bonjour account')
+                return
+            account.delete()
+            print('Account deleted')
+        else:
+            for account in self.account_manager.get_accounts():
+                account.delete()
+            print('Accounts deleted')
+
+    def show(self, sip_address=None, section=None):
+        if sip_address is None:
+            accounts = [self.account_manager.default_account]
+            if accounts[0] is None:
+                print("No accounts configured")
+                return
+        else:
+            if sip_address != 'ALL':
+                accounts = [account for account in self.account_manager.iter_accounts() if sip_address in account.id]
+            else:
+                accounts = self.account_manager.get_accounts()
+            if not accounts:
+                print('No accounts which match %s' % sip_address)
+                return
+        for account in accounts:
+            print('Account %s:' % account.id)
+            if section is None:
+                display_object(account, 'account')
+            else:
+                show_sections(account, section)
+
+    def set(self, *args):
+        if not args:
+            raise TypeError("set must receive at least one argument")
+        if '=' in args[0]:
+            accounts = [self.account_manager.default_account]
+            if accounts[0] is None:
+                print("No accounts configured")
+                return
+        else:
+            sip_address = args[0]
+            args = args[1:]
+            if sip_address != 'ALL':
+                accounts = [account for account in self.account_manager.iter_accounts() if sip_address in account.id]
+            else:
+                accounts = self.account_manager.get_accounts()
+            if not accounts:
+                print('No accounts which match %s' % sip_address)
+                return
+
+        try:
+            settings = dict(arg.split('=', 1) for arg in args)
+        except ValueError:
+            print('Illegal arguments: %s' % ' '.join(args))
+            return
+
+        for account in accounts:
+            for attrname, value in settings.items():
+                object = account
+                name = attrname
+                while '.' in name:
+                    local_name, name = name.split('.', 1)
+                    try:
+                        object = getattr(object, local_name)
+                    except AttributeError:
+                        print('Unknown setting: %s' % attrname)
+                        object = None
+                        break
+                if object is not None:
+                    try:
+                        attribute = getattr(type(object), name)
+                        value = SettingsParser.parse(attribute.type, value)
+                        setattr(object, name, value)
+                    except AttributeError:
+                        print('Unknown setting: %s' % attrname)
+                    except ValueError as e:
+                        print('%s: %s' % (attrname, str(e)))
+
+            account.save()
+        print('Account%s updated' % ('s' if len(accounts) > 1 else ''))
+
+    def import_account(self, sip_address=None):
+        """Copy an account's credentials (address, password, authentication user name, display name) from the
+        configuration of the SIP SIMPLE clients or Blink; only the credentials, nothing else of theirs."""
+        found = []
+        for directory in sipconfig.SEARCH_DIRECTORIES[1:]:
+            try:
+                accounts, default = sipconfig.accounts(directory)
+            except sipconfig.ConfigError as e:
+                print('Cannot read %s: %s' % (directory, e))
+                continue
+            found += [(account, directory) for account in accounts if account.password]
+        if sip_address is not None:
+            found = [(account, directory) for account, directory in found if sip_address in account.id]
+        if not found:
+            print('No accounts with credentials %sin %s' % ('matching %s ' % sip_address if sip_address else '', ', '.join(sipconfig.SEARCH_DIRECTORIES[1:])))
+            return
+        seen = set()
+        for source_account, directory in found:
+            if source_account.id in seen:
+                continue        # the first folder that has it
+            seen.add(source_account.id)
+            if self.account_manager.has_account(source_account.id):
+                account = self.account_manager.get_account(source_account.id)
+                action = 'updated'
+            else:
+                try:
+                    account = Account(source_account.id)
+                except ValueError as e:
+                    print('Cannot add %s: %s' % (source_account.id, e))
+                    continue
+                account.enabled = True
+                action = 'imported'
+            account.auth.password = source_account.password
+            account.auth.username = source_account.auth_username if source_account.auth_username != source_account.username else None
+            if source_account.display_name:
+                account.display_name = source_account.display_name
+            account.save()
+            print('Account %s %s from %s' % (source_account.id, action, os.path.join(directory, 'config')))
+
+    def default(self, sip_address):
+        possible_accounts = [account for account in self.account_manager.iter_accounts() if sip_address in account.id]
+        if len(possible_accounts) > 1:
+            print("More than one account exists which matches %s: %s" % (sip_address, ", ".join(sorted(account.id for account in possible_accounts))))
+            return
+        if len(possible_accounts) == 0:
+            print('Account %s does not exist' % sip_address)
+            return
+        account = possible_accounts[0]
+        try:
+            self.account_manager.default_account = account
+        except ValueError as e:
+            print(str(e))
+            return
+        print('Account %s is now default account' % account.id)
+
+
+def apply_settings(obj, args):
+    """Set key=value[.subkey]=value arguments on a settings object (DEFAULT resets, None clears); False when one was wrong."""
+    try:
+        settings = dict(arg.split('=', 1) for arg in args)
+    except ValueError:
+        print('Illegal arguments: %s' % ' '.join(args))
+        return False
+    ok = True
+    for attrname, value in settings.items():
+        object = obj
+        name = attrname
+        while '.' in name:
+            local_name, name = name.split('.', 1)
+            object = getattr(object, local_name, None)
+            if object is None:
+                break
+        try:
+            if object is None:
+                raise AttributeError
+            attribute = getattr(type(object), name)
+            if not isinstance(attribute, Setting):
+                raise AttributeError
+            setattr(object, name, SettingsParser.parse(attribute.type, value))
+        except AttributeError:
+            print('Unknown setting: %s' % attrname)
+            ok = False
+        except (TypeError, ValueError) as e:
+            print('%s: %s' % (attrname, str(e)))
+            ok = False
+    return ok
+
+
+def settings_of(cls):
+    return sorted(name for name in dir(cls) if isinstance(getattr(cls, name, None), Setting))
+
+
+class GeneralConfigurator(object):
+    """SylkSettings: what applies to every session unless the session says otherwise."""
+
+    def __init__(self):
+        ConfigurationManager().start()
+
+    def show(self):
+        print('General settings:')
+        display_object(SylkSettings(), 'general')
+
+    def set(self, *args):
+        if not args:
+            raise TypeError('set needs key=value arguments')
+        settings = SylkSettings()
+        if apply_settings(settings, args):
+            settings.save()
+            print('General settings updated')
+
+
+def _title(kind):
+    return kind[:1].upper() + kind[1:]
+
+
+class NamedConfigurator(object):
+    """Sessions and Cameras: objects with an id (session1, camera1 ...) and a name, found by either."""
+
+    cls = None
+    kind = None
+
+    def __init__(self):
+        ConfigurationManager().start()
+
+    def _all(self):
+        raise NotImplementedError
+
+    def _find(self, name):
+        raise NotImplementedError
+
+    def _get(self, name):
+        item = self._find(name)
+        if item is None:
+            print('No %s %s (%s)' % (self.kind, name, ', '.join(item.label for item in self._all()) or 'none configured'))
+        return item
+
+    def _summary(self, item):
+        raise NotImplementedError
+
+    def list(self):
+        items = self._all()
+        if not items:
+            print('No %ss' % self.kind)
+        for item in items:
+            print('  %s%s: %s' % (item.label, ' (%s)' % item.id if item.name else '', self._summary(item)))
+
+    def show(self, name=None):
+        items = self._all() if name is None else [self._get(name)]
+        for item in items:
+            if item is not None:
+                print('%s %s (%s):' % (_title(self.kind), item.label, item.id))
+                display_object(item, self.kind)
+
+    def set(self, name, *args):
+        if not args:
+            raise TypeError('set needs key=value arguments')
+        item = self._get(name)
+        if item is not None and apply_settings(item, args):
+            item.save()
+            print('%s %s updated' % (_title(self.kind), item.label))
+
+    def delete(self, name):
+        item = self._get(name)
+        if item is not None:
+            item.delete()
+            print('%s %s deleted' % (_title(self.kind), item.label))
+
+    def _new(self, name, args, id=None, cls=None):
+        if self._find(name) is not None or (issubclass(cls or self.cls, (RTSPCamera, LocalCamera)) and find_camera(name) is not None):
+            print('%s %s already exists' % (_title(self.kind), name))
+            return None
+        item = create(cls or self.cls, name, id)
+        if not apply_settings(item, args):
+            return None
+        return item
+
+
+class SessionConfigurator(NamedConfigurator):
+    """Sessions: what a room is joined with (room, account, cameras, overrides of the general settings)."""
+
+    cls = Session
+    kind = 'session'
+
+    def _all(self):
+        return sessions()
+
+    def _find(self, name):
+        return find_session(name)
+
+    def _summary(self, item):
+        parts = [] if item.name else ['room %s' % item.room]      # a named one shows its room as its id
+        if item.account:
+            parts.append('account %s' % item.account)
+        if item.cameras:
+            parts.append('cameras %s' % ', '.join(item.cameras))
+        if SylkSettings().default_session in (item.id, item.name):
+            parts.append('default')
+        return ', '.join(parts)
+
+    def add(self, room, *args):
+        """A session for room (its id: one session per room); name= gives it a name."""
+        if find_session(room) is not None and find_session(room).id == room:
+            print('There is a session for room %s already' % room)
+            return
+        options = [arg for arg in args if not arg.startswith('name=')]
+        name = next((arg.partition('=')[2] for arg in args if arg.startswith('name=')), None)
+        item = create(Session, name, room)
+        if item.id != room:
+            print('Cannot use %s as the session\'s id' % room)
+            return
+        if not apply_settings(item, options):
+            return
+        for camera in item.cameras or []:
+            if find_camera(camera) is None:
+                print('Note: there is no camera %s (yet)' % camera)
+        item.save()
+        print('Session %s added' % ('%s (room %s)' % (name, room) if name else room))
+
+    def set(self, name, *args):
+        """As for every kind, and room= moves the session to another room (its id)."""
+        rooms = [arg.partition('=')[2] for arg in args if arg.startswith('room=')]
+        others = [arg for arg in args if not arg.startswith('room=')]
+        item = self._get(name)
+        if item is None:
+            return
+        if rooms:
+            room = rooms[-1]
+            if not room or (find_session(room) is not None and find_session(room) is not item):
+                print('There is a session for room %s already' % room if room else 'room cannot be empty')
+                return
+            old = item.id
+            change_id(item, room)
+            settings = SylkSettings()
+            if settings.default_session == old:
+                settings.default_session = room
+                settings.save()
+            print('Session %s moved from room %s to %s' % (item.label, old, room))
+        if others:
+            if not apply_settings(item, others):
+                return
+        item.save()
+        if others:
+            print('Session %s updated' % item.label)
+
+    def default(self, name):
+        item = self._get(name)
+        if item is not None:
+            settings = SylkSettings()
+            settings.default_session = item.id
+            settings.save()
+            print('Session %s is now the default session' % item.label)
+
+
+def credentials_in(item):
+    """Whether an RTSP camera has credentials of its own: in its settings or in its address."""
+    return bool(item.user) or (bool(item.url) and urlsplit(item.url).username is not None)
+
+
+def credentials_of(item):
+    """(user, password) a camera connects with: its own, else the default ones."""
+    if credentials_in(item):
+        return item.user, item.password
+    defaults = CameraDefaults()
+    return defaults.user, defaults.password
+
+
+def camera_mac(url):
+    """The MAC address of the camera at url, when it is on the LAN and answers; None otherwise."""
+    from sylkrtc import onvif
+    host = urlsplit(url).hostname if url else None
+    return onvif.mac_address(host) if host else None
+
+
+class _CameraConfigurator(NamedConfigurator):
+    """What RTSP and local cameras share; names are unique across both."""
+
+    def _all(self):
+        return [item for item in cameras() if isinstance(item, self.cls)]
+
+    def _find(self, name):
+        item = find_camera(name)
+        return item if isinstance(item, self.cls) else None
+
+    def check(self, name=None):
+        """Check that the cameras (all, or the one named) work."""
+        items = self._all() if name is None else [self._get(name)]
+        if name is not None and items[0] is None:
+            return
+        if not items:
+            print('No %ss' % self.kind)
+        failed = 0
+        for item in items:
+            ok, summary = self._check(item)
+            failed += not ok
+            print('  %s%s: %s' % (item.label, '' if item.enabled else ' (disabled)', summary))
+        if failed and len(items) > 1:
+            print('%d of %d %ss failed' % (failed, len(items), self.kind))
+
+
+def _with_model(item, text):
+    return text + (' [%s]' % item.model if item.model and item.model != item.name else '')
+
+
+class LocalCameraConfigurator(_CameraConfigurator):
+    """LocalCameras: video devices of this machine (V4L2) or test patterns, usable by any session."""
+
+    cls = LocalCamera
+    kind = 'local camera'
+
+    def _summary(self, item):
+        source = item.device or ('test pattern %s' % item.pattern if item.pattern else 'no device')
+        return _with_model(item, source + ('' if item.enabled else ' (disabled)'))
+
+    def add(self, name, source, *args):
+        """A device (/dev/videoN) or a test pattern (test[:pattern])."""
+        if source.startswith(('rtsp://', 'rtsps://')):
+            print('%s is an RTSP camera: sylk-settings -r add' % source)
+            return
+        if source == 'test' or source.startswith('test:'):
+            key = 'pattern=%s' % (source.partition(':')[2] or 'smpte')
+        else:
+            key = 'device=%s' % source
+        item = self._new(name, (key,) + args)
+        if item is None:
+            return
+        item.save()
+        print('Local camera %s added (%s)' % (name, item.id))
+
+    def discover(self, *args):
+        """Find this machine's video capture devices and add those not configured yet; add=no only shows them."""
+        from sylkrtc import v4l2
+        try:
+            options = dict(arg.split('=', 1) for arg in args)
+        except ValueError:
+            print('Illegal arguments: %s' % ' '.join(args))
+            return
+        if set(options) - {'add'}:
+            print('Unknown argument: %s (add)' % ', '.join(sorted(set(options) - {'add'})))
+            return
+        add = options.get('add', 'yes').lower() not in ('no', 'false', '0', 'off')
+        found = v4l2.devices()
+        if not found:
+            print('No video capture devices (/sys/class/video4linux)')
+            return
+        configured = {os.path.realpath(item.device): item for item in local_cameras() if item.device}
+        names = {(item.name or '').lower() for item in cameras()}
+        for device in found:
+            print('%s: %s (%s%s)' % (device.node, device.name, device.driver, ', %s' % device.bus if device.bus else ''))
+            same = configured.get(os.path.realpath(device.path))
+            if same is not None:
+                if not same.model:
+                    same.model = device.name
+                    same.save()
+                print('  already configured as %s' % same.label)
+                continue
+            if device.stable_path:
+                print('  %s' % device.stable_path)
+            if not add:
+                continue
+            name = device.name
+            if name.lower() in names:
+                name = '%s %s' % (name, os.path.basename(device.node))
+            names.add(name.lower())
+            item = self._new(name, ['device=%s' % device.path, 'model=%s' % device.name])
+            if item is not None:
+                item.save()
+                print('  added as local camera %s (%s)' % (name, item.id))
+
+    def _check(self, item):
+        if item.device:
+            if not os.path.exists(item.device):
+                return False, '%s does not exist' % item.device
+            if not os.access(item.device, os.R_OK):
+                return False, '%s is not readable (video group?)' % item.device
+            return True, 'ok'
+        if item.pattern:
+            return True, 'ok (test pattern %s)' % item.pattern
+        return False, 'no device'
+
+
+class RTSPCameraConfigurator(_CameraConfigurator):
+    """RTSPCameras: network cameras, usable by any session, by their MAC address when known."""
+
+    cls = RTSPCamera
+    kind = 'RTSP camera'
+
+    def _summary(self, item):
+        return _with_model(item, re.sub(r'//[^/@]*@', '//', item.url or 'no address') + ('' if item.enabled else ' (disabled)'))
+
+    def add(self, name, url, *args):
+        """An RTSP camera (rtsp://...): its id is its MAC address when it is on this LAN and answers."""
+        if not url.startswith(('rtsp://', 'rtsps://')):
+            print('%s is not an rtsp:// address (a local device: sylk-settings -c add)' % url)
+            return
+        mac = camera_mac(url)
+        item = self._new(name, ('url=%s' % url,) + args, mac)
+        if item is None:
+            return
+        item.save()
+        print('RTSP camera %s added (%s)' % (name, item.id if mac else '%s, MAC address unknown: not on this LAN or not answering' % item.id))
+
+    def _check(self, item):
+        from sylkrtc import rtsp
+        if not item.url:
+            return False, 'no address'
+        result = rtsp.probe(item.url, *credentials_of(item))
+        summary = result.summary
+        if not result.ok and result.code is None:
+            from sylkrtc import onvif
+            now = onvif.host_of_mac(item.id)
+            if now and now != urlsplit(item.url).hostname:
+                summary += '; its MAC address is at %s now (sylk-settings -r discover updates it)' % now
+        return result.ok, summary
+
+    def defaults(self, *args):
+        """Show, or set (user=, password=), the credentials of the RTSP cameras without their own (RTSPCameras: default)."""
+        defaults = CameraDefaults()
+        if args:
+            if not apply_settings(defaults, args):
+                return
+            defaults.save()
+            print('Default camera credentials updated')
+        print('Default camera credentials: %s' % ('user %s, password %s' % (defaults.user, '********' if defaults.password and not SHOW_PASSWORDS else defaults.password or 'none') if defaults.user else 'none'))
+        users = [item.label for item in rtsp_cameras() if item.url and not credentials_in(item)]
+        if users:
+            print('Used by: %s' % ', '.join(users))
+
+    def identify(self, name=None):
+        """Give the RTSP cameras (all, or the one named) their MAC address as id, so they are found again
+        when their IP address changes."""
+        from sylkrtc import onvif
+        items = rtsp_cameras() if name is None else [self._get(name)]
+        for item in items:
+            if item is None or not isinstance(item, RTSPCamera) or not item.url:
+                continue
+            if onvif.normalize_mac(item.id):
+                print('  %s: %s' % (item.label, item.id))
+                continue
+            mac = camera_mac(item.url)
+            if mac is None:
+                print('  %s: MAC address unknown (%s not on this LAN, or not answering)' % (item.label, urlsplit(item.url).hostname))
+                continue
+            other = find_camera(mac)
+            if other is not None and other is not item:
+                print('  %s: %s is already the id of %s' % (item.label, mac, other.label))
+                continue
+            old_id = item.id
+            change_id(item, mac)
+            item.save()
+            print('  %s: %s (was %s)' % (item.label, mac, old_id))
+
+    def discover(self, *args):
+        """Find the ONVIF cameras on the LAN and add those not configured yet, with their RTSP address.
+        Arguments: user=, password= (else the credentials of the cameras already configured are tried),
+        timeout= (seconds to wait for answers, 3), interface= (the IPv4 address to send from),
+        add=no (only show what is found)."""
+        from sylkrtc import onvif
+        try:
+            options = dict(arg.split('=', 1) for arg in args)
+        except ValueError:
+            print('Illegal arguments: %s' % ' '.join(args))
+            return
+        unknown = set(options) - {'user', 'password', 'timeout', 'interface', 'add'}
+        if unknown:
+            print('Unknown argument%s: %s (user, password, timeout, interface, add)' % ('s' if len(unknown) > 1 else '', ', '.join(sorted(unknown))))
+            return
+        add = options.get('add', 'yes').lower() not in ('no', 'false', '0', 'off')
+        try:
+            timeout = float(options.get('timeout', 3))
+        except ValueError:
+            print('timeout: not a number')
+            return
+        print('Looking for ONVIF cameras for %g s...' % timeout)
+        try:
+            devices = onvif.discover(timeout=timeout, interface=options.get('interface'))
+        except OSError as e:
+            print('Cannot send the discovery probe: %s' % e)
+            return
+        if not devices:
+            print('No ONVIF cameras answered (WS-Discovery may be off in the cameras, or multicast blocked on this network)')
+            return
+        known = {}
+        for camera in rtsp_cameras():
+            host = urlsplit(camera.url).hostname if camera.url else None
+            if host:
+                known[host] = camera
+        credentials = []
+        defaults = CameraDefaults()
+        default_credentials = (defaults.user, defaults.password or '') if defaults.user else None
+        if 'user' in options:
+            credentials.append((options['user'], options.get('password', '')))
+        else:
+            if default_credentials:
+                credentials.append(default_credentials)
+            for camera in rtsp_cameras():
+                if camera.user and (camera.user, camera.password or '') not in credentials:
+                    credentials.append((camera.user, camera.password or ''))
+            credentials.append((None, None))     # cameras that answer anyone
+        names = {(camera.name or '').lower() for camera in cameras()}
+        for device in devices:
+            mac = onvif.mac_address(device.address, ports=(urlsplit(device.device_service or '').port or 80, 554))
+            print('%s: %s%s' % (device.address, device.description, ', MAC %s' % mac if mac else ''))
+            same = find_camera(mac) if mac else None
+            if same is not None and isinstance(same, RTSPCamera) and same.url:
+                host = urlsplit(same.url).hostname
+                if not same.model and device.description != 'camera':
+                    same.model = device.description
+                    same.save()
+                if host != device.address:
+                    same.url = onvif.with_host(same.url, device.address)
+                    same.save()
+                    print('  camera %s moved from %s: its address is updated' % (same.label, host))
+                else:
+                    print('  already configured as %s' % same.label)
+                continue
+            if device.address in known:
+                item = known[device.address]
+                if not item.model and device.description != 'camera':
+                    item.model = device.description
+                    item.save()
+                if mac and not onvif.normalize_mac(item.id) and find_camera(mac) is None:
+                    old_id = item.id
+                    change_id(item, mac)
+                    item.save()
+                    print('  already configured as %s, its id is now its MAC address (was %s)' % (item.label, old_id))
+                else:
+                    print('  already configured as %s' % item.label)
+                continue
+            uri = size = used = None
+            errors = []
+            for user, password in credentials:
+                try:
+                    uri, size = onvif.stream_uri(device, user, password)
+                except onvif.ONVIFError as e:
+                    errors.append('%s: %s' % (user or 'no credentials', e))
+                    continue
+                used = (user, password)
+                break
+            guessed = False
+            if uri is None:
+                uri = onvif.guess_stream_uri(device)
+                guessed = uri is not None
+                print('  ONVIF refused (%s)' % '; '.join(errors) if errors else '  ONVIF gave no address')
+                if uri is None:
+                    print('  give its credentials: sylk-settings -r discover user=... password=...')
+                    continue
+                used = (options['user'], options.get('password', '')) if 'user' in options else (None, None)   # only what was given
+            print('  %s%s%s' % (re.sub(r'//[^/@]*@', '//', uri), ' (%dx%d)' % size if size else '', ' (the usual address of this make, not confirmed by the camera)' if guessed else ''))
+            if not add:
+                continue
+            name = device.name or device.hardware or 'Camera'
+            if name.lower() in names:
+                name = '%s %s' % (name, device.address)
+            names.add(name.lower())
+            arguments = ['url=%s' % uri] + (['model=%s' % device.description] if device.description != 'camera' else [])
+            if used and used[0] and used != default_credentials:     # the default ones are not copied: they stay shared
+                arguments += ['user=%s' % used[0], 'password=%s' % used[1]]
+            if mac is None and used and used[0]:
+                mac = onvif.onvif_mac(device, *used)
+            item = self._new(name, arguments, mac, RTSPCamera)
+            if item is not None:
+                item.save()
+                print('  added as RTSP camera %s (%s)' % (name, item.id))
+
+
+
+if __name__ == '__main__':
+    description = ("This script manages the configuration of sylk-conference and sylk-session in ~/.sylkclient/config: general settings, "
+                   "sessions (what a room is joined with), cameras (usable by any session) and accounts "
+                   "(whose credentials can be imported from the SIP SIMPLE clients and Blink).")
+    usage = """%prog [--general|--session|--rtsp-camera|--local-camera|--account] [options] command [arguments]
+       %prog --general show
+       %prog --general set key1=value1|DEFAULT [key2=value2 ...]
+       %prog --session list
+       %prog --session add room [name=name] [account=user@domain] [cameras=name1,name2] [key=value ...]
+       %prog --session show [room|name]
+       %prog --session set room|name key1=value1|DEFAULT|None [room=another] [key2=value2 ...]
+       %prog --session default room|name
+       %prog --session delete room|name
+       %prog --rtsp-camera list
+       %prog --rtsp-camera add name rtsp://... [user=name password=secret] [key=value ...]
+       %prog --rtsp-camera show [name]
+       %prog --rtsp-camera set name key1=value1|DEFAULT|None [key2=value2 ...]
+       %prog --rtsp-camera delete name
+       %prog --rtsp-camera check [name]
+       %prog --rtsp-camera discover [user=name password=secret] [timeout=3] [interface=address] [add=no]
+       %prog --rtsp-camera identify [name]
+       %prog --rtsp-camera defaults [user=name password=secret]
+       %prog --local-camera list
+       %prog --local-camera add name /dev/videoN|test[:pattern] [key=value ...]
+       %prog --local-camera show [name]
+       %prog --local-camera set name key1=value1|DEFAULT|None [key2=value2 ...]
+       %prog --local-camera delete name
+       %prog --local-camera check [name]
+       %prog --local-camera discover [add=no]
+       %prog --account list
+       %prog --account add user@domain password
+       %prog --account delete user@domain|ALL
+       %prog --account show [user@domain|ALL] [section[.subsection][,section...]]
+       %prog --account set [user@domain|ALL] key1=value1|DEFAULT [key2=value2|DEFAULT ...]
+       %prog --account default user@domain
+       %prog --account import [user@domain]"""
+    parser = OptionParser(usage=usage, description=description)
+    parser.print_usage = parser.print_help
+    parser.add_option('-d', '--config-directory', type='string', dest='config_directory',
+                      help='The configuration directory to use (default: %s).' % sipconfig.DEFAULT_DIRECTORY)
+    parser.add_option("-g", "--general", action="store_true", dest="general", help="Manage the general settings")
+    parser.add_option("-s", "--session", action="store_true", dest="session", help="Manage the sessions")
+    parser.add_option("-r", "--rtsp-camera", action="store_true", dest="rtsp_camera", help="Manage the RTSP cameras")
+    parser.add_option("-c", "--local-camera", action="store_true", dest="local_camera", help="Manage the local cameras (video devices, test patterns)")
+    parser.add_option("-a", "--account", action="store_true", dest="account", help="Manage the accounts")
+    parser.add_option("--discover", action="store_true", dest="discover", help="With --rtsp-camera or --local-camera: find the cameras and add them (the discover command)")
+    parser.add_option("--show-passwords", action="store_true", dest="show_passwords", help="Show passwords instead of ********")
+    options, args = parser.parse_args()
+    # exactly one of -g, -s, -m or -a must be specified
+    if [bool(options.general), bool(options.session), bool(options.rtsp_camera), bool(options.local_camera), bool(options.account)].count(True) != 1:
+        parser.print_usage()
+        sys.exit(1)
+
+    if options.discover:
+        if not (options.rtsp_camera or options.local_camera):
+            sys.stderr.write("Error: --discover goes with --rtsp-camera or --local-camera\n")
+            sys.exit(1)
+        args = ['discover'] + args
+    # there must be at least one command
+    if not args:
+        sys.stderr.write("Error: no command specified\n")
+        parser.print_usage()
+        sys.exit(1)
+
+    SHOW_PASSWORDS = bool(options.show_passwords)
+    config_directory = os.path.expanduser(options.config_directory) if options.config_directory else sipconfig.DEFAULT_DIRECTORY
+    os.makedirs(config_directory, mode=0o700, exist_ok=True)
+    command, args = args[0], args[1:]
+    if command == 'import' and options.account:
+        command = 'import_account'
+
+    print('Configuration: %s' % os.path.join(config_directory, 'config'))
+    SIPApplication.storage = FileStorage(config_directory)
+    thread_manager = ThreadManager()
+    thread_manager.start()
+
+    # execute the handlers
+    try:
+        if options.account:
+            object = AccountConfigurator()
+        elif options.general:
+            object = GeneralConfigurator()
+        elif options.session:
+            object = SessionConfigurator()
+        else:
+            object = RTSPCameraConfigurator() if options.rtsp_camera else LocalCameraConfigurator()
+    except ConfigurationError as e:
+        sys.stderr.write("Failed to load the configuration in %s: %s\n" % (config_directory, str(e)))
+    else:
+        handler = getattr(object, command, None)
+        if handler is None or command.startswith('_') or not callable(handler):
+            sys.stderr.write("Error: illegal command: %s\n" % command)
+            parser.print_usage()
+            sys.exit(1)
+
+        try:
+            handler(*args)
+        except TypeError:
+            sys.stderr.write("Error: illegal usage of command %s\n" % command)
+            parser.print_usage()
+            sys.exit(1)
+    finally:
+        thread_manager.stop()

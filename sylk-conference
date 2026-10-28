@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+
+# Copyright (C) 2026 AG Projects (https://ag-projects.com)
+# Licensed under the GNU General Public License, version 3 or later (see LICENSE).
+
+"""Join a SylkServer conference room over WebRTC with audio and chat, and publish
+local or RTSP cameras in it, without a SIP stack: a pure SylkServer client.
+
+Its own folder is ~/.sylkclient/. Its config file (the SIP SIMPLE configuration
+format, managed with sylk-settings) holds:
+
+    SylkSettings    general settings: audio devices, muted, TLS verification, default session
+    Sessions        what a room is joined with: room, account, cameras, overrides of the general settings
+    RTSPCameras     RTSP cameras, usable by any session
+    LocalCameras    V4L2 devices or test patterns, usable by any session
+    Accounts        accounts of its own
+
+Accounts are searched in ~/.sylkclient, then in the SIP SIMPLE clients' ~/.sipclient
+and Blink's ~/.blink (read only, for credentials): the one named with -a or by the
+session, else the default account of the first that has one.
+
+    sylk-conference                    the default session
+    sylk-conference garden             the session named garden (or whose room is garden)
+    sylk-conference myroom@example.com a room without a session: general settings, no cameras
+
+Typed lines are sent to the room's chat; /help lists the commands. For a call
+to someone (1 to 1), see sylk-session.
+"""
+
+import argparse
+import logging
+import os
+import sys
+
+from application.notification import IObserver, NotificationCenter
+from application.python import Null
+from twisted.internet import reactor, stdio
+from twisted.internet.task import deferLater
+from zope.interface import implementer
+
+from sylkrtc import sipconfig
+from sylkrtc.cli import (Console, Statistics, addresses, report_discovery, report_server_info, select_cameras,
+                         setup_logging, start_log_file, take_room_from_cameras)
+from sylkrtc.discovery import Discovery
+from sylkrtc.rooms import RoomTarget, parse_room, configuration_domain
+from sylkrtc.videoroom import Identity, VideoroomSession, MAX_EXTRA_VIDEOS
+
+
+log = logging.getLogger('sylk-conference')
+
+from sylkrtc.device import USER_AGENT     # one device for all the tools (sylkrtc.device)
+RETRY_DELAYS = [5, 10, 20, 40, 60]      # s between attempts to join again / to restart a camera
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Join a SylkServer conference room with audio and chat over WebRTC and publish cameras in it.')
+    parser.add_argument('room', nargs='?', help='a session (sylk-settings --session), or a room: a name (on the account\'s domain), room@domain or a link; '
+                                                 'default: the default session')
+    parser.add_argument('-d', '--config-dir', help='the folder whose config file holds the account (default: ~/.sylkclient/, else the credentials '
+                                                     'of the SIP SIMPLE clients\' ~/.sipclient/ or of Blink\'s ~/.blink/)')
+    parser.add_argument('-a', '--account', help='the account to use (default: the default account)')
+    parser.add_argument('-r', '--rtsp-camera', action='append', nargs='?', const='all', default=[], metavar='CAMERA',
+                        help='publish an RTSP camera too (repeatable): without a value or all, every enabled one configured; a configured one by name or id (MAC), '
+                             'or LABEL=rtsp://... (credentials in it), optionally followed by ,transcode=auto|yes|no ,resolution=640x360 ,fps=10')
+    parser.add_argument('-c', '--local-camera', action='append', nargs='?', const='all', default=[], metavar='CAMERA',
+                        help='the local cameras (repeatable); by default the one attached: an external (USB) camera when plugged in, '
+                             'else the built-in one; without a value or all, every camera attached; none (false, 0): no local camera; '
+                             'a configured one by name or id, or LABEL=/dev/videoN or LABEL=test[:pattern], optionally followed by '
+                             ',resolution=640x360 ,fps=10. The first local camera is our own video, the others are shown under it')
+    parser.add_argument('-i', '--invite', action='append', default=[], metavar='USER',
+                        help='invite someone once in the room (repeatable, or comma separated): user@domain, or user at the account\'s domain')
+    parser.add_argument('--audio-input', help='auto, none or a GStreamer source description')
+    parser.add_argument('--audio-output', help='auto, none or a GStreamer sink description')
+    parser.add_argument('--muted', action='store_true', default=None, help='start with the microphone muted')
+    parser.add_argument('--discover', action='store_true', help='only look up the SylkServer configuration of the account\'s domain (and of the room\'s, when given), cache it and show it')
+    parser.add_argument('--server-info', action='store_true', help='connect to the SylkServer of the account (or of the room, when given) and report its version, '
+                                                                  'what it supports and whether it takes the account')
+    parser.add_argument('--stats-interval', type=float, default=60, metavar='SECONDS',
+                        help='log the bandwidth, round trip time and loss of every stream this often (default %(default)g, 0: never); a summary is logged on leaving')
+    parser.add_argument('--auto-disconnect', type=float, default=600, metavar='SECONDS',
+                        help='leave the room and exit this many seconds after first getting in (default %(default)g, 10 minutes; 0: stay)')
+    parser.add_argument('--no-retry', action='store_true', help='exit when the room is left instead of joining again')
+    parser.add_argument('--no-input', action='store_true', help='do not read chat messages and commands from the terminal')
+    parser.add_argument('-v', '--verbose', '--debug', dest='debug', action='store_true', help='log debug messages')
+    parser.add_argument('--sdp', action='store_true', help='log the SDP offers and answers exchanged')
+    parser.add_argument('-t', '--trace', action='store_true', help='log the sylkRTC messages')
+    return parser.parse_args()
+
+
+@implementer(IObserver)
+class SylkConference(object):
+    def __init__(self, arguments):
+        self.arguments = arguments
+        # our own folder: the settings, sessions, cameras, the cache and possibly our own accounts;
+        # another client's (~/.sipclient, ~/.blink) only for credentials
+        os.makedirs(sipconfig.DEFAULT_DIRECTORY, mode=0o700, exist_ok=True)
+        try:
+            configuration = sipconfig.SylkConfiguration()
+        except sipconfig.ConfigError as e:
+            raise SystemExit(str(e))
+        reporting = arguments.discover or arguments.server_info
+        if arguments.room is None:
+            take_room_from_cameras(arguments, configuration)
+        # the session: named on the command line, the one whose room was given, else the default one; a room without one is joined as it is
+        session = None
+        if arguments.room:
+            session = configuration.find_session(arguments.room) or configuration.session_for_room(arguments.room)
+        elif configuration.default_session:
+            session = configuration.find_session(configuration.default_session)
+            if session is None and not reporting:
+                raise SystemExit(f'the default session {configuration.default_session} does not exist (sylk-settings --session list)')
+        self.configuration_session = session
+        self.room_text = (session or {}).get('room') or arguments.room
+        if not self.room_text and not reporting:
+            raise SystemExit('which room? give a room or a session (sylk-settings --session add ..., --session default ...)')
+        try:
+            self.account, self.config_dir = sipconfig.locate_account(arguments.account or (session or {}).get('account'),
+                                                                      os.path.expanduser(arguments.config_dir) if arguments.config_dir else None)
+        except sipconfig.ConfigError as e:
+            raise SystemExit(str(e))
+        if not self.account.password and not reporting:
+            raise SystemExit(f'{self.account.id} has no password in {os.path.join(self.config_dir, "config")}')
+
+        def setting(name, given):
+            # the command line, else the session, else the general setting
+            if given is not None:
+                return given
+            if session is not None and session.get(name) is not None:
+                return session[name]
+            return getattr(configuration, name)
+
+        self.audio_input = setting('audio_input', arguments.audio_input)
+        self.audio_output = setting('audio_output', arguments.audio_output)
+        self.muted = setting('muted', arguments.muted)
+        self.verify_tls = configuration.tls_verify_server
+        self.cameras = select_cameras(configuration, arguments.rtsp_camera, arguments.local_camera, (session or {}).get('cameras'),
+                                      (session or {}).get('name'), default_local=not reporting)
+        # a local camera (the first one) is our own video: the other cameras, the RTSP ones, are shown under it
+        self.main_camera = next(((label, source) for label, source in self.cameras if source['kind'] in ('v4l2', 'test')), None)
+        if self.main_camera is not None:
+            self.cameras.remove(self.main_camera)
+        if len(self.cameras) > MAX_EXTRA_VIDEOS:
+            raise SystemExit(f'at most {MAX_EXTRA_VIDEOS} cameras besides our own video, {len(self.cameras)} asked for: {", ".join(label for label, source in self.cameras)}')
+        self.discovery = Discovery(os.path.join(sipconfig.DEFAULT_DIRECTORY, 'sylkserver'))
+        self.identity = Identity.from_credentials(self.account.id, self.account.password, self.account.display_name,
+                                                  auth_username=self.account.auth_username, instance_id=self.account.instance_id)
+        self.target = None
+        self.remote = False
+        self.session = None
+        self.extras = {}            # label -> ExtraVideo
+        self.camera_retries = {}    # label -> attempts
+        self.attempt = 0
+        self.stopping = False
+        self.statistics = Statistics(arguments.stats_interval)
+        NotificationCenter().add_observer(self)
+
+    # Start
+
+    def start(self):
+        if self.arguments.discover:
+            self.discover()
+            return
+        if self.arguments.server_info:
+            self.server_info()
+            return
+        from sylkrtc.gst import media_missing, media_report
+        log.info(f'{USER_AGENT}, {media_report()}')
+        missing = media_missing()
+        if missing:
+            log.error('missing: ' + ', '.join(f'{what} (install {package})' for what, package in missing))
+            reactor.stop()
+            return
+        log.info(f'account {self.account.id} (from {os.path.join(self.config_dir, "config")}), room {self.room_text}'
+                 + (f' (session {self.configuration_session["name"]})' if self.configuration_session else '')
+                 + (f', our video {self.main_camera[0]}' if self.main_camera else '')
+                 + (f', cameras {", ".join(label for label, source in self.cameras)}' + (' (under it)' if self.main_camera else '') if self.cameras else ''))
+        self.discovery.discover(self.account.domain).addCallback(self._own_configuration)
+
+    def _report_domain(self):
+        parsed = parse_room(self.room_text) if self.room_text else None
+        return configuration_domain(parsed[1]) if parsed is not None and parsed[1] else None
+
+    def discover(self):
+        """--discover: the account's domain (and the room's), looked up again, cached and shown."""
+        domains = [self.account.domain]
+        other = self._report_domain()
+        if other and other not in domains:
+            domains.append(other)
+        parsed = parse_room(self.room_text) if self.room_text else None
+        report_discovery(self.discovery, self.account, self.config_dir, domains, parsed[0] if parsed else None)
+
+    def server_info(self):
+        """--server-info: connect to the gateway (the room's, when given) and report what it is and does."""
+        report_server_info(self.discovery, self.account, self.config_dir, self._report_domain() or self.account.domain, USER_AGENT, self.verify_tls)
+
+
+    def _own_configuration(self, configuration):
+        if not configuration or not self.discovery.ws_server(self.account.domain):
+            self.fail(f'{self.account.domain} publishes no SylkServer configuration with a wsServer')
+            return
+        parsed = parse_room(self.room_text)
+        if parsed is None:
+            self.fail(f'not a room: {self.room_text}')
+            return
+        room, host = parsed
+        domain = configuration_domain(host) if host else self.account.domain
+        if domain == self.account.domain:
+            self._resolved(room, domain, configuration, remote=False)
+        else:
+            log.info(f'looking up the SylkServer of {domain}')
+            self.discovery.discover(domain).addCallback(lambda other: self._resolved(room, domain, other, remote=True))
+
+    def _resolved(self, room, domain, configuration, remote):
+        if not configuration or not configuration.get('wsServer'):
+            self.fail(f'{domain} runs no SylkServer (no configuration with a wsServer)')
+            return
+        self.target = RoomTarget(room, domain, configuration)
+        self.remote = remote
+        log.info(f'room {self.target.video_uri} at {self.target.ws_server}' + (' (another SylkServer)' if remote else ''))
+        self.join()
+
+    def fail(self, reason):
+        log.error(reason)
+        if reactor.running:
+            reactor.stop()
+
+    # The room
+
+    def join(self):
+        if self.stopping:
+            return
+        from sylkrtc.gst import MediaFactory
+        self.session = VideoroomSession(self.identity, self.target.video_uri, self.target.ws_server,
+                                        MediaFactory(audio_input=self.audio_input, audio_output=self.audio_output,
+                                                     video_source=self.main_camera[1] if self.main_camera else None),
+                                        ice_servers=self.target.ice_servers, guest_domain=self.target.guest_domain if self.remote else None,
+                                        audio=not self.muted, video=self.main_camera is not None, receive_video=False, user_agent=USER_AGENT,
+                                        verify_tls=self.verify_tls)
+        self.extras.clear()
+        self.session.join()
+
+    def _auto_leave(self):
+        log.info(f'{self.arguments.auto_disconnect:g} s in the room: leaving (--auto-disconnect)')
+        if reactor.running:
+            reactor.stop()      # the shutdown trigger leaves the room
+
+    def leave(self):
+        self.stopping = True
+        self.statistics.summary()
+        self.statistics.stop()
+        if self.session is not None and self.session.state not in ('idle', 'terminated'):
+            self.session.leave()
+            return deferLater(reactor, 0.5, lambda: None)      # the leave requests go out
+        return None
+
+
+    def add_camera(self, label, source):
+        if self.session is None or self.session.state != 'established' or self.stopping:
+            return
+        self.extras[label] = self.session.add_extra_video(dict(source), label)
+
+    # Notifications
+
+    def handle_notification(self, notification):
+        handler = getattr(self, '_NH_%s' % notification.name, Null)
+        handler(notification)
+
+    def _NH_VideoroomSessionDidChangeState(self, notification):
+        if notification.sender is not self.session:
+            return
+        state = notification.data.state
+        if state == 'established':
+            self.attempt = 0
+            self.statistics.start(self.session)
+            log.info(f'in the room {self.session.room}' + (f' as {self.session.address}' if self.session.guest else '') +
+                     (' (microphone muted)' if self.session.audio_muted else ''))
+            for label, source in self.cameras:
+                self.add_camera(label, source)
+            if self.arguments.invite and not getattr(self, '_invited', False):
+                self._invited = True        # once: not again after joining anew
+                invitees = addresses(self.arguments.invite, self.account.domain)
+                log.info(f'inviting {", ".join(invitees)}')
+                self.session.invite(invitees)
+            if self.arguments.auto_disconnect and not getattr(self, '_auto_disconnect', None):
+                log.info(f'leaving in {self.arguments.auto_disconnect:g} s (--auto-disconnect)')
+                self._auto_disconnect = reactor.callLater(self.arguments.auto_disconnect, self._auto_leave)
+        elif state == 'terminated':
+            self.statistics.ended()
+            if self.stopping or self.arguments.no_retry:
+                if not self.stopping and reactor.running:
+                    reactor.stop()
+                return
+            delay = RETRY_DELAYS[min(self.attempt, len(RETRY_DELAYS) - 1)]
+            self.attempt += 1
+            log.info(f'joining again in {delay} s')
+            reactor.callLater(delay, self.join)
+
+    def _NH_VideoroomExtraVideoDidChangeState(self, notification):
+        extra = notification.sender
+        if extra.session is not self.session:
+            return
+        if notification.data.state == 'established':
+            self.camera_retries[extra.label] = 0
+        elif notification.data.state == 'ended' and not self.stopping and self.session.state == 'established' and notification.data.reason not in ('left', 'stopped'):
+            attempts = self.camera_retries.get(extra.label, 0)
+            self.camera_retries[extra.label] = attempts + 1
+            delay = RETRY_DELAYS[min(attempts, len(RETRY_DELAYS) - 1)]
+            log.info(f'{extra.label}: trying again in {delay} s')
+            source = next(source for label, source in self.cameras if label == extra.label)
+            if source.get('mac'):
+                # its MAC address may answer at another IP address now (DHCP)
+                from urllib.parse import urlsplit
+                from sylkrtc.onvif import host_of_mac, with_host
+                host, now = urlsplit(source['url']).hostname, host_of_mac(source['mac'])
+                if now and now != host:
+                    log.info(f'{extra.label}: its MAC address {source["mac"]} is at {now} now, not {host}')
+                    source['url'] = with_host(source['url'], now)
+            session = self.session
+            reactor.callLater(delay, lambda: session is self.session and self.add_camera(extra.label, source))
+
+    def _NH_VideoroomSessionParticipantDidJoin(self, notification):
+        participant = notification.data.participant
+        if notification.sender is self.session and participant.visible and not participant.parent:
+            print(f'* {participant.name} joined')
+
+    def _NH_VideoroomSessionParticipantDidLeave(self, notification):
+        participant = notification.data.participant
+        if notification.sender is self.session and participant.visible and not participant.parent:
+            print(f'* {participant.name} left')
+
+    def _NH_VideoroomSessionAudioMutedDidChange(self, notification):
+        if notification.sender is self.session and notification.data.by:
+            print(f'* microphone {"muted" if notification.data.muted else "unmuted"} by {notification.data.by}')
+
+    def _NH_VideoroomSessionGotMessage(self, notification):
+        if notification.sender is not self.session:
+            return
+        data = notification.data
+        if data.sender_uri.lower() in (self.session.address.lower(), self.identity.address.lower()):
+            return      # our own, back from the room
+        who = data.sender_name or data.sender_uri or 'room'
+        if data.content_type.startswith('text/'):
+            print(f'{who}: {data.content}')
+        else:
+            print(f'{who}: [{data.content_type}, {len(data.content)} bytes]')
+
+    def _NH_VideoroomSessionInviteStatus(self, notification):
+        if notification.sender is self.session and notification.data.state in ('success', 'failed'):
+            data = notification.data
+            print(f'* invitation to {data.uri}: ' + ('accepted' if data.state == 'success' else f'failed ({data.code} {data.reason})'.replace(' )', ')')))
+
+    def _NH_VideoroomSessionDidDeliverMessage(self, notification):
+        if notification.sender is self.session and not notification.data.delivered:
+            print(f'* message not delivered: {notification.data.code} {notification.data.reason}')
+
+    # The terminal
+
+    def input(self, line):
+        if not line:
+            return
+        if getattr(self, 'log_file', None) is not None:
+            self.log_file.typed(line)
+        session = self.session
+        if line.startswith('/'):
+            command, _, rest = line[1:].partition(' ')
+            command = command.lower()
+            if command in ('quit', 'exit', 'q'):
+                reactor.stop()
+            elif command == 'mute' and session is not None:
+                session.set_audio_muted(True)
+            elif command == 'unmute' and session is not None:
+                session.set_audio_muted(False)
+            elif command == 'hand' and session is not None:
+                session.toggle_hand()
+            elif command == 'invite' and session is not None and rest.strip():
+                session.invite(addresses(rest.split(), self.account.domain))
+            elif command == 'who' and session is not None:
+                people = [participant.name for participant in session.participants.values() if participant.visible and not participant.parent]
+                print('* ' + (', '.join(sorted(people)) if people else 'nobody else'))
+                if self.main_camera:
+                    print(f'* our video: {self.main_camera[0]}')
+                for extra in session.extra_videos.values():
+                    media = extra.media
+                    sent = f', {media.bytes_sent // 1024} KB sent' if media is not None else ''
+                    how = (' (relayed)' if media.relay else ' (encoded)') if media is not None and extra.state == 'established' else ''
+                    print(f'* our {extra.label}: {extra.state}{how}{sent}')
+            else:
+                print('* /mute, /unmute, /hand, /who, /invite user@domain ..., /quit; anything else goes to the chat')
+            return
+        if session is None or session.state != 'established':
+            print('* not in the room')
+            return
+        session.send_message(line)
+
+
+def main():
+    arguments = parse_arguments()
+    setup_logging(arguments)
+    log_file = start_log_file('sylk-conference')
+    client = SylkConference(arguments)
+    client.log_file = log_file
+    if not arguments.no_input and sys.stdin.isatty():
+        stdio.StandardIO(Console(client))
+    reactor.addSystemEventTrigger('before', 'shutdown', client.leave)     # SIGINT and SIGTERM stop the reactor
+    reactor.callWhenRunning(client.start)
+    reactor.run()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,20 @@
+include LICENSE
+include README
+include MANIFEST.in
+include makedeb.sh
+include setup.py
+include pyproject.toml
+include sylk-account
+include sylk-addressbook
+include sylk-conference
+include sylk-journal
+include sylk-session
+include sylk-settings
+include debian/changelog
+include debian/compat
+include debian/control
+include debian/copyright
+include debian/docs
+include debian/rules
+include debian/source/format
+

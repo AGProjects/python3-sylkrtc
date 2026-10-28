@@ -1,0 +1,5 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+# the package itself is described in setup.py (it builds on distributions without pybuild-plugin-pyproject)

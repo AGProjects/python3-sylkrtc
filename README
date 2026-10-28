@@ -1,0 +1,379 @@
+python3-sylkrtc
+===============
+
+A client library for SylkServer's WebRTC gateway (the sylkRTC protocol), with
+the command line tools built on it. What the gateway gives an account, without a
+SIP stack of its own: video rooms (audio, video, chat, cameras), 1 to 1 calls,
+and the account's addressbook, the same Sylk Mobile, sylk-desktop and Blink use.
+
+Tools:
+
+  sylk-conference  joins a video room with audio and chat, and publishes local
+                   and RTSP (LAN) cameras in it: a headless room client, or a
+                   camera bridge
+  sylk-session     makes and takes 1 to 1 calls (audio, video, messages, DTMF)
+  sylk-addressbook shows and changes the account's addressbook: contacts and
+                   groups, cached locally
+  sylk-account     shows the account's private storage on SylkServer: the
+                   contact avatars and the PGP key escrow
+  sylk-journal     the account's message journal on SylkServer: a summary by
+                   content type, counted by the server
+  sylk-settings    manages their configuration (~/.sylkclient): accounts,
+                   general settings, sessions, RTSP and local cameras
+
+Modules (package sylkrtc):
+
+  discovery   SylkServer discovery: the _sylkserver.<domain> TXT record, the
+              domain's configuration document (wsServer, iceServers, conference
+              and guest domains), cached per domain
+  rooms       room addresses: links, room@domain, room names; RoomTarget
+  connection  the sylkRTC-2 WebSocket to a webrtcgateway (twisted + autobahn)
+  videoroom   joining a video room: publisher, feeds, participants, moderation,
+              chat, extra videos; independent of the media
+  call        the account at the gateway: registration, 1 to 1 calls (its
+              session API: placing, taking, answering, DTMF, messages), and
+              the addressbook requests
+  addressbook the addressbook (contacts, groups, policies) and its local cache
+  gst         the media with GStreamer webrtcbin (audio publisher, feeds' audio
+              mixed to the speakers, extra videos from RTSP, V4L2 or a test source;
+              CallMedia: a call's audio and video both ways)
+  device      who the tools are to SylkServer: one device for all of them
+              (User-Agent, device id and name)
+  serverapi   the account's HTTPS API (account storage, message journal), with
+              the API token
+  cli         what the command line clients share
+  sipconfig   finding the account to use in ~/.sylkclient, ~/.sipclient and ~/.blink
+              (the same SIP SIMPLE configuration format), read only
+  sdp         SDP helpers
+  settings    the sylk clients' settings in the SDK's configuration (sylk-settings)
+  onvif       finding cameras on the LAN (WS-Discovery) and their RTSP address (ONVIF)
+  rtsp        checking that an RTSP camera answers (DESCRIBE, Basic or Digest auth)
+  v4l2        this machine's video capture devices (sysfs and VIDIOC_QUERYCAP)
+
+The sylkRTC protocol has implementations in JavaScript for the other Sylk
+clients; this package is the Python one:
+
+  sylkrtc.js               https://github.com/AGProjects/sylkrtc.js
+                           desktop and web: sylk-desktop, https://github.com/AGProjects/sylk-webrtc
+  react-native-sylkrtc.js  https://github.com/AGProjects/react-native-sylkrtc.js
+                           mobile: Sylk Mobile, https://github.com/AGProjects/sylk-mobile
+  SylkServer (the gateway) https://github.com/AGProjects/sylkserver
+
+Everything runs in the twisted reactor thread and reports with the
+NotificationCenter of python3-application; logging goes to the 'sylkrtc' logger.
+A client with another media stack (libwebrtc on macOS) gives VideoroomSession its
+own media factory (see sylkrtc/videoroom.py for what it is told and tells back).
+
+
+Using the library in a client
+-----------------------------
+
+The server keeps the list of the devices that use an account (sylk-account
+devices, the Devices tab of Blink's Data manager). Every account-add says which
+device sends it, so a client names itself:
+
+    session = VideoroomSession(identity, room, ws_server, media_factory,
+                               user_agent='Blink 6.2.0 (Linux)',
+                               device_id=instance_id, device_name='Blink Qt on ag-xps (Linux)')
+    account = Account(identity, ws_server, user_agent=..., device_id=..., device_name=...)
+    connection = Connection(url, user_agent=..., verify_tls=..., device_id=..., device_name=...)
+    api = ServerAPI(program, account_info, token, verify_tls, user_agent=..., device_id=..., device_name=...)
+
+device_id is the client's own stable id (Blink: its SIP instance id), device_name
+is for humans, without a version (the version belongs in user_agent). Without
+them the tools' identity is used (below), and its id is read from, or made in,
+~/.sylkclient/config. One connection is kept per wsServer URL (Connections): the
+first session or account that opens it gives its arguments, so a process is
+expected to be one client.
+
+Nothing is registered at the gateway unless Account.register() is called: a
+client that registers over SIP itself (Blink) only adds the account, so the
+gateway does not fork its calls and messages. The library runs in the twisted
+reactor thread and posts its notifications there; logging goes to the 'sylkrtc'
+logger, for the client to forward to its own log.
+
+
+The tools as a device
+---------------------
+
+All the tools are one device to the server: python-sylkrtc on <host>, with the
+User-Agent python-sylkrtc <version>, the same over HTTPS (X-Sylk-Device-Id,
+X-Sylk-Device-Name) and over the WebSocket (account-add deviceId, deviceName).
+The id is the general setting device_id of ~/.sylkclient/config, made at the
+first use of any tool (sylk-settings --general show lists it). The file
+~/.sylkclient/device_id that sylk-account kept before is taken over once, so its
+entry on the server carries on. Changing device_id makes the tools a new device.
+
+
+sylk-conference
+---------------
+
+Joins a room with audio and chat over WebRTC, without SIP, and publishes up to
+four cameras in it as videos of the same participant (the gateway feature
+multiple-video-feeds).
+
+Its own folder is ~/.sylkclient/ (created when missing). Its config file is in
+the SIP SIMPLE configuration format, where indentation matters: manage it with
+sylk-settings, as sip-settings3 does for ~/.sipclient. It holds:
+
+    SylkSettings:                       general
+        audio_input = none              ; auto, none or a GStreamer source description
+        audio_output = none             ; auto, none or a GStreamer sink description
+        muted = false
+        tls_verify_server = false
+        default_session = myroom
+
+    Sessions:                           what a room is joined with, by room: one session per room
+        myroom:                         a room name, room@domain or a room link
+            name = "My home conference"
+            account = alice@example.com ; else the default account
+            cameras = Garden, Desk      ; by name or id
+            muted = true                ; overrides the general setting (audio_input, audio_output too)
+
+    RTSPCameras:                        network cameras, usable by any session
+        default:                        credentials of the RTSP cameras without their own
+            user = admin
+            password = secret
+        a4-14-37-0b-cc-12:              its MAC address when known (cameraN otherwise)
+            name = Garden
+            model = "HIKVISION DS-2CD3345-I"   ; what the camera calls itself, set by discover
+            url = rtsp://192.168.1.20/stream1
+            transcode = auto            ; auto (relay H264 when the room is H264), yes, no
+            resolution = 640x360        ; when encoded here
+            fps = 10
+
+    LocalCameras:                       video devices of this machine, usable by any session
+        local1:
+            name = Desk
+            device = /dev/video0
+            enabled = false
+        local2:
+            name = Test
+            pattern = ball              ; a GStreamer test pattern instead of a device
+
+    Accounts:                           accounts of its own (the SDK's)
+
+Accounts are searched in ~/.sylkclient, then in the SIP SIMPLE clients'
+~/.sipclient/config and Blink's ~/.blink/config (read only, for credentials): the
+one named with -a or by the session, else the default account of the first that
+has one. sylk-settings --account import copies credentials from them, --rtsp-camera
+discover adds the ONVIF cameras that answer on the LAN (their RTSP address asked
+over ONVIF with the credentials given, or those of the cameras already
+configured; for Hikvision, Dahua, Reolink and Axis the usual address when ONVIF
+refuses), --rtsp-camera check tells whether each camera answers.
+
+A camera's id is its MAC address when it can be learned (the neighbour table, or
+ONVIF): discover then recognises a camera whose IP address changed and updates its
+address, check says where its MAC address answers now, and sylk-conference retries a
+failed camera at that address. --rtsp-camera identify gives existing cameras their MAC
+address as id. RTSPCameras: default holds the credentials of the cameras that have
+none of their own (in their settings or their address); discover tries them first
+and does not copy them into the cameras it adds (--rtsp-camera defaults user= password=).
+
+Options: sylk-settings -g general, -s sessions, -r RTSP cameras, -c local cameras,
+-a accounts, -d another configuration folder. sylk-conference -r and -c publish RTSP
+and local cameras besides the session's: without a value all the enabled ones of
+that kind (sylk-conference -r myroom works too), or one configured by
+name or id, or LABEL=SOURCE; -d another folder for the account, -v debug, -t
+sylkRTC messages.
+
+Our own video is a local camera: by default the one attached, an external (USB)
+camera when one is plugged in (its USB port is removable), else the built-in one;
+without any, we publish audio only. -c alone (or -c all) uses every camera
+attached, -c NAME a configured one, -c none (false, 0) none. The first local camera
+is our video; the RTSP cameras (-r) and any other local one are published under
+it, so the others see one participant with its cameras grouped.
+
+What is joined: the session given on the command line by its room or its name,
+else the default session; a room without a session is joined with the general
+settings and no cameras. Command line options override the session, which
+overrides the general settings; -r and -c add cameras.
+
+Examples:
+
+    sylk-settings --account import alice@example.com
+    sylk-settings --general set audio_input=none audio_output=none
+    sylk-settings --rtsp-camera add Garden rtsp://192.168.1.20/stream1 user=admin password=secret
+    sylk-settings --local-camera add Desk /dev/video0
+    sylk-settings --local-camera discover           (this machine's video capture devices, by their stable /dev/v4l/by-id path)
+    sylk-settings --rtsp-camera discover                 (ONVIF cameras on the LAN, added with their RTSP address)
+    sylk-settings --rtsp-camera discover user=admin password=secret add=no
+    sylk-settings --rtsp-camera check [name]             (does each camera answer, with its credentials)
+    sylk-settings --rtsp-camera defaults user=admin password=secret
+    sylk-settings --rtsp-camera identify                 (MAC addresses as ids)
+    sylk-settings --session add myroom name="My home conference" cameras=Garden,UTE
+    sylk-settings --session set myroom room=otherroom      (moves the session to another room)
+    sylk-settings --session default myroom
+    sylk-conference --server-info
+    sylk-conference                        (the default session)
+    sylk-conference myroom                 (or sylk-conference "My home conference")
+    sylk-conference myroom                         (audio and the attached camera: external, else built-in)
+    sylk-conference -r -c myroom                   (every enabled RTSP camera and every camera attached)
+    sylk-conference myroom -c none                 (audio only)
+    sylk-conference myroom -i bob -i alice@example.org,carol   (invites them once in the room; bob means bob@<the account's domain>)
+    sylk-conference -r myroom --auto-disconnect 0     (stays: by default it leaves and exits after 10 minutes in the room)
+    sylk-conference https://example.com/conference/other -c "Test=test"
+
+Every minute (--stats-interval, 0 for never) it logs each stream's bitrate,
+bytes, round trip time and loss (from the RTCP reports), and the totals; leaving,
+a summary of what the whole run sent and received.
+
+What it shows on the console is also written, with a timestamp on each line, to
+~/.sylkclient/logs/sylk-conference-YYYY-MM-DD.log, with what is typed (chat and
+commands) as "> text".
+
+It leaves the room and exits 10 minutes after getting in (--auto-disconnect
+SECONDS, 0 to stay, as a camera bridge run by systemd would).
+
+Typed lines go to the room's chat; /mute, /unmute, /hand, /who, /invite user[@domain] ..., /quit.
+Without a terminal (--no-input, or run by systemd) it only joins, publishes and
+logs. A room that ends or a connection that drops is joined again; a camera that
+fails is started again, both with a growing delay up to a minute.
+
+RTSP cameras: an H264 camera is relayed as it is when the room's video codec is
+H264 (nothing decoded, fit for a Raspberry Pi), otherwise it is decoded and
+encoded to the room's codec at the given resolution. Relayed video keeps the
+camera's own key frame interval, so set it short (1-2 s) in the camera, or
+others wait that long to see it; set the camera's bitrate below the room's limit
+too, as relayed video does not adapt to the network. transcode = yes always
+encodes, transcode = no only relays.
+
+
+sylk-session
+------------
+
+Calls someone, or takes calls, over WebRTC: the gateway places the SIP call for
+the account (session-create; account-register and incoming-session for incoming
+calls). It uses the account, general settings and local cameras of
+sylk-conference.
+
+    sylk-session alice                  (calls alice at the account's domain)
+    sylk-session alice@example.org
+    sylk-session alice -c none          (no video of ours; theirs is still shown)
+    sylk-session                        (registers and waits for calls, asking y/n for each)
+    sylk-session --auto-answer 2        (answers by itself after 2 s)
+
+Audio both ways; our video is the camera attached (an external one when plugged
+in, else the built-in one), -c NAME a configured local camera, -c none none.
+Their video goes to the SIP SIMPLE clients' video window (sipclient.video of
+sipclients3) when it is installed, else to a GStreamer window when there is a
+display (--video-output window, auto, none or a GStreamer sink description),
+scaled to 1280x720 with its aspect kept (--video-size WxH, or native).
+
+The terminal takes single keys, no Enter; h or ? lists the ones that apply. Waiting:
+c call someone (then type user or user@domain), / type a command, q quit. A call
+ringing in: y accept, n reject; one ringing in during a call asks the same, y
+hanging up the current call first. Calling: x hang up. In a call: m mute/unmute,
+s RTP statistics (per stream rate, bytes, round trip time, loss, then the
+totals), i call info, x hang up, 0-9 * # DTMF (SIP INFO), Enter to type a message
+to the far end. The commands typed after /: /answer, /reject, /hangup,
+/call user[@domain], /mute, /unmute, /dtmf DIGITS, /stats, /quit. A call
+placed from the command line exits when it ends; waiting for calls goes on after
+each one. Ctrl-C hangs up the call (rejects one ringing in); Ctrl-C again, or out
+of a call, quits. --auto-disconnect SECONDS hangs up that long after the call is
+established (default: no limit). Bandwidth, round trip time and loss are logged
+every 10 s (--stats-interval) and on /stats, and shown over the video window;
+the console log is in ~/.sylkclient/logs/sylk-session-YYYY-MM-DD.log.
+
+
+sylk-account
+------------
+
+Shows the account's private storage on SylkServer
+(/webrtcgateway/storage/<account>): the per-account object store where the
+clients keep the contact avatars (namespace avatars) and the PGP key escrow
+(keys/pgp-private).
+
+    sylk-account                               the namespaces, usage and limits
+    sylk-account list NAMESPACE                its objects: size, type, modified, who wrote it, etag
+    sylk-account NAMESPACE                     the same (sylk-account keys)
+    sylk-account devices                       the devices that used the account: first and
+                                               last use with IP (forget one: delete devices ID)
+    sylk-account get NAMESPACE ID [-o FILE]    one object (text and JSON printed)
+    sylk-account delete NAMESPACE ID [-y]      remove one object (asks first; only the version shown)
+
+It talks HTTPS with the account's API token. The gateway does not hand that
+token to a WebSocket client, so it is taken from a client configuration that
+keeps it (Blink: ~/.blink/config), or given with --token. The server is the
+one the domain's SylkServer discovery names. -j prints the server's JSON.
+
+
+sylk-journal
+------------
+
+The account's message journal on SylkServer, the history the clients sync
+from.
+
+    sylk-journal                               how many entries, of which content
+                                               types, in and out, oldest and newest
+    sylk-journal contacts [-n N]               per contact: entries in and out
+    sylk-journal type TYPE [-n N]              one content type per contact (TYPE or part
+                                               of it: location, imdn, file-transfer)
+    sylk-journal files                         the files the server keeps: sent and
+                                               received, by type, size, age, largest
+                                               conversations, and when they expire
+
+The server counts (GET /webrtcgateway/messages/summary/<account> and
+/transfers/summary/<account>): nothing is downloaded. The token, the server and the device headers are those of
+sylk-account (sylkrtc.serverapi). -j prints the server's JSON.
+
+
+sylk-addressbook
+----------------
+
+Shows and changes the account's addressbook: the one SylkServer keeps (XCAP) and
+Sylk Mobile, sylk-desktop and Blink share. It is fetched through the gateway and
+cached in ~/.sylkclient/addressbook/<account>.json; showing it reads the cache
+(fetched when there is none, or with -f). A change fetches it anew, sends the
+change and updates the cache with what the server stored. The gateway gives the
+addressbook to a registered account only, so the account is registered while
+connected (a few seconds).
+
+    sylk-addressbook                           the contacts, then the groups
+    sylk-addressbook -f                        fetched anew
+    sylk-addressbook contacts [TEXT]           the contacts (whose name or address has TEXT)
+    sylk-addressbook groups | policies
+    sylk-addressbook show CONTACT|GROUP
+    sylk-addressbook show -c [CONTACT]         the contacts, or one
+    sylk-addressbook show -g [GROUP]           the groups, or one with its contacts
+    sylk-addressbook --check [-f]              what Blink and Sylk Mobile would repair
+    sylk-addressbook contact add NAME URI [URI...]
+    sylk-addressbook contact rename CONTACT NAME
+    sylk-addressbook contact add-uri CONTACT URI | remove-uri CONTACT URI
+    sylk-addressbook contact delete CONTACT
+    sylk-addressbook group add NAME | rename GROUP NAME | delete GROUP
+    sylk-addressbook group add-contact GROUP CONTACT... | remove-contact GROUP CONTACT...
+
+A URI is user (at the account's domain), user@domain, a number, or TYPE=URI
+(mobile=+31612345678); addresses and types are stored lowercase, a type is
+sip or tel when none is given. CONTACT and GROUP are an id, a name, a unique part of a
+name (not for delete), or for a contact one of its addresses; show lists all
+the matches of a name that is not unique. The lists show
+the ids and are sorted by id (-s name, or -s uri for contacts). The server
+stamps each change with who made it (modified_by, modified_agent:
+sylk-addressbook).
+
+--check changes nothing. It lists its rules, numbered R1, R2 ... in a fixed
+order, with their result (pass, or the number of findings), then the findings. It applies the repairs Blink for macOS (Cocoa), Blink
+Qt and Sylk Mobile (with blink-addressbook.js, which sylk-desktop uses) make
+when they start to the cached addressbook in memory, and shows, for every
+contact or group concerned, what each of them would write: group kinds, duplicate
+groups and contacts, groups not on their reserved id, the Calls group,
+videoconference. addresses, phone numbers, broken addresses (Phone=..., tel=...), names that only echo an address,
+duplicate addresses, Tel and Conference, Blocked and the presence policies,
+Deleted, presence allowed without a subscription, rooms in Messages, defaults
+and members that are not contacts. A finding marked ! is one where the clients
+would write different things. Some rules are decided rather than taken from a
+client, and their findings show the Wanted result above what the clients do: a
+conference contact is never in Messages, Tel and Conference hold only phone
+numbers and rooms, SIP addresses and address types are lowercase, no address is Bonjour's or on
+a LAN host (an instance id, a private, loopback or link-local IP, .local: XCAP
+is shared, Bonjour has none and such an address works on one LAN only; it is
+removed, with its contact when it has no other), and contacts sharing an address are one
+contact (the lowest id, with all the addresses and the groups of all; not
+Deleted unless all of them were, not Messages for a room, Blocked only if you
+say so). The report ends with a chapter for each client:
+for each rule they disagree on, what it does now and what would have to change
+in it for the three to agree. The rules depend on the conference server (--conference-domain,
+default conference.sip2sip.info) and the dial plan (--replace-leading-zero,
+--idd-prefix); what depends on a device's history or address book is left out.
