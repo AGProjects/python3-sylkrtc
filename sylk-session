@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+
+# Copyright (C) 2026 AG Projects (https://ag-projects.com)
+# Licensed under the GNU General Public License, version 3 or later (see LICENSE).
+
+"""Call someone (1 to 1), or take calls, over WebRTC through SylkServer, without a
+SIP stack: the gateway places the SIP call for the account (its session API).
+
+    sylk-session alice                call alice at the account's domain
+    sylk-session alice@example.com    call alice@example.com
+    sylk-session                      register and wait for calls: each one asks whether to accept
+                                      it (y/n), or --auto-answer
+
+Audio both ways, and video: ours from the camera attached (an external one when
+plugged in, else the built-in one; -c none for none), theirs in a window (the SIP
+SIMPLE clients' video window when sipclients3 is installed, else GStreamer's own).
+
+The account, the general settings and the local cameras are those of sylk-conference
+(~/.sylkclient/, managed with sylk-settings).
+
+The terminal takes single keys (no Enter), h or ? lists them. Waiting: c call someone,
+/ a command, q quit. A call ringing in: y accept, n reject. In a call: m mute/unmute,
+s RTP statistics, i call info, x hang up, 0-9 * # DTMF, Enter to type a message to
+the far end, / a command. Ctrl-C hangs up; Ctrl-C again quits.
+"""
+
+import argparse
+import importlib.util
+import logging
+import os
+import signal
+import sys
+import threading
+
+from application.notification import IObserver, NotificationCenter
+from application.python import Null
+from twisted.internet import reactor, stdio
+from twisted.internet.task import deferLater
+from zope.interface import implementer
+
+from sylkrtc import sipconfig
+from sylkrtc.call import Account
+from sylkrtc.cli import Console, Statistics, addresses, report_discovery, report_server_info, select_cameras, setup_logging, start_log_file
+from sylkrtc.discovery import Discovery
+from sylkrtc.rooms import RoomTarget
+from sylkrtc.videoroom import Identity
+
+
+log = logging.getLogger('sylk-session')
+
+from sylkrtc.device import USER_AGENT     # one device for all the tools (sylkrtc.device)
+
+KEYS_SHORT = {'call': 'm mute, s statistics, i info, x hang up, 0-9*# DTMF, Enter message, / command, h or ? help'}
+KEYS_HELP = {
+    'idle': '''* keys (no Enter):
+    c      call someone (type user or user@domain)
+    /      type a command (/call, /quit, ...)
+    q      quit
+    h ?    this''',
+    'incoming': '''* a call is ringing in:
+    y      accept it
+    n      reject it
+    /      type a command
+    h ?    this''',
+    'calling': '''* calling:
+    x      hang up
+    /      type a command
+    h ?    this''',
+    'call': '''* in a call, one key each:
+    m      mute / unmute the microphone
+    s      RTP statistics now: per stream rate, bytes, round trip time, loss; then the totals
+    i      who, how long, muted, video codec
+    x      hang up
+    0-9*#  DTMF (SIP INFO)
+    Enter  type a message to the far end (one line; t too)
+    /      type a command (/hangup, /mute, /stats, /dtmf, /quit, ...)
+    h ?    this''',
+}
+KEYS_HELP = {context: text + '\n    Ctrl-C ' + {'idle': 'quit', 'incoming': 'reject it; Ctrl-C again quits'}.get(context, 'hang up; Ctrl-C again quits')
+             for context, text in KEYS_HELP.items()}
+REGISTER_RETRY = [5, 10, 20, 40, 60]
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='Call someone (1 to 1) over WebRTC through SylkServer, or wait for calls.')
+    parser.add_argument('target', nargs='?', help='who to call: user (at the account\'s domain) or user@domain; '
+                                                   'without it, wait for calls')
+    parser.add_argument('-d', '--config-dir', help='the folder whose config file holds the account (default: ~/.sylkclient/, else the credentials '
+                                                     'of the SIP SIMPLE clients\' ~/.sipclient/ or of Blink\'s ~/.blink/)')
+    parser.add_argument('-a', '--account', help='the account to use (default: the default account)')
+    parser.add_argument('-c', '--local-camera', action='append', nargs='?', const='all', default=[], metavar='CAMERA',
+                        help='our video: by default the camera attached, an external (USB) one when plugged in, else the built-in one; '
+                             'none (false, 0): no video of ours; a configured local camera by name or id, or LABEL=/dev/videoN or '
+                             'LABEL=test[:pattern], optionally followed by ,resolution=640x360 ,fps=15')
+    parser.add_argument('--video-output', metavar='OUTPUT',
+                        help='where the far end\'s video goes: window (the SIP SIMPLE clients\' video window, sipclients3), auto (a GStreamer window), '
+                             'none (not received), or a GStreamer sink description; default: window when sipclients3 is installed, else auto '
+                             'when there is a display, else none')
+    parser.add_argument('--video-size', default='1280x720', metavar='WxH',
+                        help='the size the far end\'s video is shown at, its aspect kept (default %(default)s; native: as it comes)')
+    parser.add_argument('--audio-input', help='auto, none or a GStreamer source description')
+    parser.add_argument('--audio-output', help='auto, none or a GStreamer sink description')
+    parser.add_argument('--muted', action='store_true', default=None, help='start with the microphone muted')
+    parser.add_argument('--auto-answer', type=float, nargs='?', const=0, default=None, metavar='SECONDS',
+                        help='answer incoming calls by themselves (after this many seconds, default 0)')
+    parser.add_argument('--discover', action='store_true', help='only look up the SylkServer configuration of the account\'s domain, cache it and show it')
+    parser.add_argument('--server-info', action='store_true', help='connect to the SylkServer of the account and report its version, '
+                                                                  'what it supports and whether it takes the account')
+    parser.add_argument('--stats-interval', type=float, default=10, metavar='SECONDS',
+                        help='log the bandwidth, round trip time and loss of the call this often (default %(default)g, 0: never); a summary is logged at its end')
+    parser.add_argument('--auto-disconnect', type=float, default=0, metavar='SECONDS',
+                        help='hang up this many seconds after the call is established (default %(default)g: no limit)')
+    parser.add_argument('--no-input', action='store_true', help='do not read messages and commands from the terminal')
+    parser.add_argument('-v', '--verbose', '--debug', dest='debug', action='store_true', help='log debug messages')
+    parser.add_argument('--sdp', action='store_true', help='log the SDP offers and answers exchanged')
+    parser.add_argument('-t', '--trace', action='store_true', help='log the sylkRTC messages')
+    return parser.parse_args()
+
+
+def video_window_available():
+    """Whether the SIP SIMPLE clients' video window (sipclients3: sipclient.video and its window process) is installed."""
+    try:
+        return importlib.util.find_spec('sipclient.video') is not None and importlib.util.find_spec('sipclient._video_window_proc') is not None
+    except (ImportError, ValueError):
+        return False
+
+
+class RemoteVideo(object):
+    """A frame handler that opens sipclient.video.VideoWindow on the first frame (from GStreamer's thread)."""
+
+    def __init__(self, title):
+        self.title = title
+        self.window = None
+        self.closed = False
+        self._lock = threading.Lock()
+
+    def __call__(self, frame):
+        with self._lock:
+            if self.closed:
+                return
+            if self.window is None:
+                from sipclient.video import VideoWindow
+                self.window = VideoWindow(title=self.title)
+                self.window.start()
+            window = self.window
+        window.frame_handler(frame)
+
+    @property
+    def closed_by_user(self):
+        """The window was opened, then closed (by the user: we did not close it)."""
+        window = self.window
+        return window is not None and not self.closed and not window.is_alive()
+
+    def update_stats(self, stats):
+        if self.window is not None:
+            self.window.update_stats(stats)
+
+    def close(self):
+        with self._lock:
+            self.closed = True
+            window, self.window = self.window, None
+        if window is not None:
+            window.close()
+
+
+@implementer(IObserver)
+class SylkCall(object):
+    def __init__(self, arguments):
+        self.arguments = arguments
+        os.makedirs(sipconfig.DEFAULT_DIRECTORY, mode=0o700, exist_ok=True)
+        try:
+            configuration = sipconfig.SylkConfiguration()
+        except sipconfig.ConfigError as e:
+            raise SystemExit(str(e))
+        reporting = arguments.discover or arguments.server_info
+        try:
+            self.account_info, self.config_dir = sipconfig.locate_account(arguments.account, os.path.expanduser(arguments.config_dir) if arguments.config_dir else None)
+        except sipconfig.ConfigError as e:
+            raise SystemExit(str(e))
+        if not self.account_info.password and not reporting:
+            raise SystemExit(f'{self.account_info.id} has no password in {os.path.join(self.config_dir, "config")}')
+        self.audio_input = arguments.audio_input if arguments.audio_input is not None else configuration.audio_input
+        self.audio_output = arguments.audio_output if arguments.audio_output is not None else configuration.audio_output
+        self.muted = arguments.muted if arguments.muted is not None else configuration.muted
+        self.verify_tls = configuration.tls_verify_server
+        if any(text.lower() == 'all' for text in arguments.local_camera):
+            raise SystemExit('-c: a call sends one camera, name it (or leave -c out for the one attached)')
+        cameras = select_cameras(configuration, [], arguments.local_camera, default_local=not reporting)
+        self.camera = cameras[0] if cameras else None
+        output = (arguments.video_output or '').strip()
+        if not output:
+            if video_window_available():
+                output = 'window'
+            elif os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY') or sys.platform == 'darwin':
+                output = 'auto'
+            else:
+                output = 'none'
+        elif output == 'window' and not video_window_available():
+            raise SystemExit('--video-output window: the SIP SIMPLE clients\' video window (sipclients3, sipclient.video) is not installed')
+        self.video_output = output
+        size = (arguments.video_size or 'native').strip().lower()
+        if size == 'native':
+            self.video_size = None
+        else:
+            try:
+                width, height = (int(value) for value in size.split('x'))
+            except ValueError:
+                raise SystemExit(f'--video-size {arguments.video_size}: expected WxH (1280x720) or native')
+            self.video_size = (width - width % 2, height - height % 2)
+        self.target = addresses([arguments.target], self.account_info.domain)[0] if arguments.target else None
+        self.discovery = Discovery(os.path.join(sipconfig.DEFAULT_DIRECTORY, 'sylkserver'))
+        self.identity = Identity.from_credentials(self.account_info.id, self.account_info.password, self.account_info.display_name,
+                                                  auth_username=self.account_info.auth_username, instance_id=self.account_info.instance_id)
+        self.server = None          # RoomTarget of the account's domain: wsServer and ICE servers
+        self.account = None
+        self.call = None
+        self.window = None
+        self.stopping = False
+        self.register_attempt = 0
+        self._auto_disconnect = None
+        self._auto_answer = None
+        self.waiting_call = None        # a second call ringing in during a call: y takes it, n rejects it
+        self.switch_to = None           # the waiting call to answer once the current one is gone
+        self.statistics = Statistics(arguments.stats_interval)
+        self._hud_timer = None
+        self._hud_previous = None       # (time, bytes sent, bytes received)
+        NotificationCenter().add_observer(self)
+
+    # Start
+
+    def start(self):
+        if self.arguments.discover:
+            report_discovery(self.discovery, self.account_info, self.config_dir, [self.account_info.domain])
+            return
+        if self.arguments.server_info:
+            report_server_info(self.discovery, self.account_info, self.config_dir, self.account_info.domain, USER_AGENT, self.verify_tls)
+            return
+        from sylkrtc.gst import media_missing, media_report
+        log.info(f'{USER_AGENT}, {media_report()}')
+        missing = media_missing()
+        if missing:
+            log.error('missing: ' + ', '.join(f'{what} (install {package})' for what, package in missing))
+            reactor.stop()
+            return
+        log.info(f'account {self.account_info.id} (from {os.path.join(self.config_dir, "config")})'
+                 + (f', our video {self.camera[0]}' if self.camera else ', no video of ours')
+                 + f', their video: {self.video_output}')
+        self.discovery.discover(self.account_info.domain).addCallback(self._configured)
+
+    def _configured(self, configuration):
+        if not configuration or not configuration.get('wsServer'):
+            self.fail(f'{self.account_info.domain} publishes no SylkServer configuration with a wsServer')
+            return
+        self.server = RoomTarget('room', self.account_info.domain, configuration)
+        self.account = Account(self.identity, self.server.ws_server, user_agent=USER_AGENT, verify_tls=self.verify_tls)
+        if self.target:
+            self.place_call(self.target)
+        else:
+            log.info(f'registering {self.account_info.id} at {self.server.ws_server} to take calls')
+            self.account.register()
+
+    def fail(self, reason):
+        log.error(reason)
+        if reactor.running:
+            reactor.stop()
+
+    # Calls
+
+    def media_factory(self, call):
+        from sylkrtc.gst import CallMedia
+        output = self.video_output
+        if output == 'none':
+            output = None
+        elif output == 'window':
+            self.window = output = RemoteVideo(f'{call.peer} - sylk-session')
+        return CallMedia(call, audio_input=self.audio_input, audio_output=self.audio_output,
+                         video_source=self.camera[1] if self.camera else None, video_output=output, ice_servers=self.server.ice_servers,
+                         video_size=self.video_size)
+
+    def place_call(self, uri):
+        if self.call is not None:
+            print('* already in a call (/hangup first)')
+            return
+        log.info(f'calling {uri}')
+        self.interrupted = False
+        self.call = self.account.call(uri, self.media_factory, ice_servers=self.server.ice_servers, audio=not self.muted)
+
+    def answer(self):
+        call = self.call
+        if call is None or call.state != 'incoming':
+            print('* no call to answer')
+            return
+        if self._auto_answer is not None and self._auto_answer.active():
+            self._auto_answer.cancel()
+        call.answer(self.media_factory, ice_servers=self.server.ice_servers, audio=not self.muted)
+
+    def _auto_hangup(self):
+        self._auto_disconnect = None
+        if self.call is not None:
+            log.info(f'{self.arguments.auto_disconnect:g} s in the call: hanging up (--auto-disconnect)')
+            self.call.hangup()
+
+    def leave(self):
+        self.stopping = True
+        busy = self.call is not None and self.call.state not in ('idle', 'terminated')
+        if busy:
+            self.call.hangup()
+        self.statistics.stop()
+        if self.window is not None:
+            self.window.close()
+        if self.account is not None:
+            self.account.close()
+            return deferLater(reactor, 0.5, lambda: None)      # the terminate and unregister requests go out
+        return None
+
+    # Notifications
+
+    def handle_notification(self, notification):
+        handler = getattr(self, '_NH_%s' % notification.name, Null)
+        handler(notification)
+
+    def _NH_SylkRTCAccountRegistrationDidChange(self, notification):
+        if notification.sender is not self.account:
+            return
+        state, reason = notification.data.state, notification.data.reason
+        if state == 'registered':
+            if self.register_attempt or not getattr(self, '_announced', False):
+                print(f'* registered as {self.account.address}: waiting for calls' + (' (answered by themselves)' if self.arguments.auto_answer is not None else '')
+                      + ('; h for the keys' if getattr(self, 'console', None) is not None else ', /answer or /reject them'))
+            self._announced = True
+            self.register_attempt = 0
+        elif state == 'failed' and not self.stopping:
+            delay = REGISTER_RETRY[min(self.register_attempt, len(REGISTER_RETRY) - 1)]
+            self.register_attempt += 1
+            log.warning(f'registration failed ({reason}): trying again in {delay} s')
+            reactor.callLater(delay, lambda: not self.stopping and self.account.register())
+
+    def _NH_SylkRTCAccountGotIncomingCall(self, notification):
+        call = notification.data.call
+        if self.target or (self.call is not None and (self.waiting_call is not None or getattr(self, 'console', None) is None)):
+            log.info(f'busy: rejecting the call from {call.peer}')
+            call.hangup('busy')
+            return
+        if self.call is not None:
+            # a second call: it may replace the current one
+            self.waiting_call = call
+            video = "with" if "m=video" in (call.offer or "") else "no"
+            print(f'* incoming call from {call.peer} ({video} video) while in a call with {self.call.peer}: '
+                  f'accept it and hang up the call with {self.call.peer}? (y/n)\a', flush=True)
+            return
+        self.call = call
+        self.interrupted = False
+        video = "with" if "m=video" in (call.offer or "") else "no"
+        if self.arguments.auto_answer is not None:
+            print(f'* incoming call from {call.peer} ({video} video)')
+            self._auto_answer = reactor.callLater(self.arguments.auto_answer, self.answer)
+        elif getattr(self, 'console', None) is not None:
+            # as sip-audio-session3: one key, no Enter (keys())
+            print(f'* incoming call from {call.peer} ({video} video), do you want to accept? (y/n)\a', flush=True)
+        else:
+            print(f'* incoming call from {call.peer} ({video} video): /answer or /reject')
+
+    def _NH_SylkRTCAccountMissedCall(self, notification):
+        if notification.sender is self.account:
+            print(f'* missed call from {notification.data.originator}')
+
+    def _NH_SylkRTCCallDidChangeState(self, notification):
+        call = notification.sender
+        if call is self.waiting_call:
+            if notification.data.state == 'terminated':
+                print(f'* {call.peer} stopped calling: {notification.data.reason}')
+                self.waiting_call = None
+                if self.switch_to is call:
+                    self.switch_to = None
+            return
+        if call is not self.call:
+            return
+        state = notification.data.state
+        if state == 'ringing':
+            print(f'* ringing {call.peer}')
+        elif state == 'established':
+            print(f'* in a call with {call.peer}' + (' (microphone muted)' if call.audio_muted else ''))
+            self.established_at = reactor.seconds()
+            if getattr(self, 'console', None) is not None:
+                print(f'* keys: {KEYS_SHORT["call"]}')
+            self.statistics.start(call)
+            self._hud_previous = None
+            if self._hud_timer is None:
+                from sylkrtc.util import RepeatingTimer
+                self._hud_timer = RepeatingTimer(1, self._update_hud)
+            self._hud_timer.start()
+            if self.arguments.auto_disconnect:
+                self._auto_disconnect = reactor.callLater(self.arguments.auto_disconnect, self._auto_hangup)
+        elif state == 'terminated':
+            print(f'* call with {call.peer} ended: {notification.data.reason}')
+            if self._auto_disconnect is not None and self._auto_disconnect.active():
+                self._auto_disconnect.cancel()
+            if self._auto_answer is not None and self._auto_answer.active():
+                self._auto_answer.cancel()
+            self._auto_disconnect = self._auto_answer = None
+            if self._hud_timer is not None:
+                self._hud_timer.stop()
+            self.statistics.summary()
+            self.statistics.ended()
+            if self.window is not None:
+                self.window.close()
+                self.window = None
+            self.call = None
+            # a call that rang in meanwhile: answered when it was chosen (y), else asked about again
+            waiting, switch = self.waiting_call, self.switch_to
+            self.waiting_call = self.switch_to = None
+            if waiting is not None and waiting.state == 'incoming' and not self.stopping:
+                self.call = waiting
+                if switch is waiting:
+                    self.interrupted = False    # after Ctrl-C the next one still quits
+                    print(f'* answering the call from {waiting.peer}')
+                    self.answer()
+                else:
+                    print(f'* {waiting.peer} is still calling, do you want to accept? (y/n)\a', flush=True)
+                return
+            if self.target and not self.stopping and reactor.running:
+                reactor.stop()          # a call placed from the command line: done
+
+    def _update_hud(self):
+        """Every second: hang up when the video window was closed; the window's overlay (bandwidth, round trip
+        time, loss) every 2 s."""
+        call, window = self.call, self.window
+        if call is not None and window is not None and window.closed_by_user:
+            self._video_window_closed(call)
+            return
+        self._hud_tick = not getattr(self, '_hud_tick', False)
+        if not self._hud_tick:
+            return      # the overlay every 2 s
+        if call is None or call.state != 'established' or window is None or call.media is None or call.media.webrtcbin is None:
+            return
+        from sylkrtc.gst import webrtcbin_stats
+        stats = webrtcbin_stats(call.media.webrtcbin)
+        now = reactor.seconds()
+        previous, self._hud_previous = self._hud_previous, (now, stats['sent_bytes'], stats['received_bytes'])
+        if previous is None:
+            return
+        elapsed = max(1e-3, now - previous[0])
+        sent = 8 * (stats['sent_bytes'] - previous[1]) / elapsed / 1000
+        received = 8 * (stats['received_bytes'] - previous[2]) / elapsed / 1000
+        total = stats['received_packets'] + stats['lost_received']
+        hud = dict(bandwidth_kbps=round(received), extra={'sent': f'{sent:.0f} kbit/s', 'received': f'{received:.0f} kbit/s',
+                                                         'loss in': f'{100.0 * stats["lost_received"] / total:.1f}%' if total else '-'})
+        if stats['rtt'] is not None:
+            hud['rtt_ms'] = round(stats['rtt'] * 1000)
+        if stats['fraction_lost_sent'] is not None:
+            hud['packet_loss'] = round(100.0 * stats['fraction_lost_sent'], 1)
+        if call.media.video_codec:
+            hud['codec'] = call.media.video_codec
+        try:
+            window.update_stats(hud)
+        except Exception as e:
+            log.debug(f'video window statistics: {e}')
+
+    def _video_window_closed(self, call):
+        if call.state in ('idle', 'terminated'):
+            return
+        print('* video window closed: hanging up')
+        call.hangup('video window closed')
+
+    def _NH_SylkRTCCallVideoWindowDidClose(self, notification):
+        if notification.sender is self.call:
+            self._video_window_closed(notification.sender)
+
+    def _NH_SylkRTCCallWillTerminate(self, notification):
+        if notification.sender is self.call:
+            self.statistics.sample()        # what the call carried, before its media goes
+
+    def _NH_SylkRTCCallGotRemoteVideo(self, notification):
+        if notification.sender is self.call:
+            log.info(f'their video: {notification.data.width}x{notification.data.height}'
+                     + (f', shown at {self.video_size[0]}x{self.video_size[1]}' if self.video_size else ''))
+
+    def _NH_SylkRTCCallGotMessage(self, notification):
+        if notification.sender is not self.call:
+            return
+        data = notification.data
+        if data.content_type.startswith('text/'):
+            print(f'{data.sender or self.call.peer}: {data.content}')
+        else:
+            print(f'{data.sender or self.call.peer}: [{data.content_type}, {len(data.content)} bytes]')
+
+    # Single keys, no Enter (sip-audio-session3 style), what each means depending on the call
+
+    def keys_context(self):
+        call = self.call
+        state = call.state if call is not None else None
+        if state is None or state == 'terminated':
+            return 'idle'
+        if state == 'incoming':
+            return 'incoming'
+        if state == 'established':
+            return 'call'
+        return 'calling'
+
+    def key(self, key):
+        """One key typed. True when a line is typed next (a message, a command, who to call)."""
+        context = self.keys_context()
+        call = self.call
+        if key in ('?', 'h'):
+            print(KEYS_HELP[context])
+            if self.waiting_call is not None:
+                print(f'* {self.waiting_call.peer} is calling too:\n'
+                      f'    y      accept it, hanging up the call with {call.peer}\n'
+                      f'    n      reject it')
+            return False
+        waiting = self.waiting_call
+        if waiting is not None and key in 'yYnN':
+            if key in 'yY':
+                print(f'* accepted: hanging up the call with {call.peer} first')
+                self.switch_to = waiting
+                call.hangup()
+            else:
+                print(f'* rejected the call from {waiting.peer}')
+                self.waiting_call = None
+                waiting.reject()
+            return False
+        if key == '/':
+            self.line_purpose = 'command'
+            print('/', end='', flush=True)
+            return True
+        if context == 'idle':
+            if key == 'c':
+                if self.account is None:
+                    print('* not connected yet')
+                    return False
+                self.line_purpose = 'call'
+                print('call: ', end='', flush=True)
+                return True
+            if key == 'q':
+                self.interrupt()
+                return False
+        elif context == 'incoming':
+            if key in 'yY':
+                print('* accepted')
+                self.answer()
+            elif key in 'nN':
+                print('* rejected')
+                call.reject()
+            return False
+        elif context == 'calling':
+            if key == 'x':
+                print(f'* hanging up the call to {call.peer}')
+                call.hangup()
+        elif context == 'call':
+            if key in ('\n', 't'):
+                self.line_purpose = 'message'
+                print('message: ', end='', flush=True)
+                return True
+            if key == 'm':
+                call.set_audio_muted(not call.audio_muted)
+                print('* microphone muted' if call.audio_muted else '* microphone on')
+            elif key == 's':
+                lines = self.statistics.lines()
+                print('\n'.join(f'* {line}' for line in lines) if lines else '* no statistics yet')
+            elif key == 'i':
+                seconds = int(reactor.seconds() - (getattr(self, 'established_at', None) or reactor.seconds()))
+                codec = getattr(call.media, 'video_codec', None) if call.media is not None else None
+                print(f'* in a call with {call.peer} for {seconds // 60}:{seconds % 60:02d}'
+                      + (', microphone muted' if call.audio_muted else '') + (f', video {codec}' if codec else ''))
+            elif key == 'x':
+                print(f'* hanging up the call with {call.peer}')
+                call.hangup()
+            elif key in '0123456789*#':
+                if call.send_dtmf(key):
+                    print(f'* DTMF {key}')
+        return False
+
+    def resume_keys(self):
+        """Back to single keys (after a typed line, and at the start)."""
+        if getattr(self, 'console', None) is not None:
+            self.console.ask_key(self.key)
+
+    # Ctrl-C: the first hangs up the call (rejects one ringing in), the next one quits
+
+    def interrupt(self):
+        call = self.call
+        if call is not None and call.state != 'terminated' and not getattr(self, 'interrupted', False):
+            self.interrupted = True
+            if call.state == 'incoming':
+                print('\n* rejected (Ctrl-C again to quit)')
+                call.reject()
+            else:
+                print(f'\n* hanging up the call with {call.peer} (Ctrl-C again to quit)')
+                call.hangup()
+            return
+        if getattr(self, 'quitting', False):
+            return
+        self.quitting = True
+        print('\n* quitting')
+        try:
+            reactor.stop()
+        except Exception:
+            pass        # already stopping
+
+    # The terminal
+
+    def input(self, line):
+        purpose, self.line_purpose = getattr(self, 'line_purpose', None), None
+        if purpose == 'command':
+            line = '/' + line if line else ''
+        elif purpose == 'call':
+            line = '/call ' + line if line else ''
+        try:
+            if purpose == 'message':
+                self._message(line)     # as typed, even when it starts with /
+            else:
+                self._input(line)
+        finally:
+            self.resume_keys()
+
+    def _message(self, line):
+        if not line:
+            return
+        if getattr(self, 'log_file', None) is not None:
+            self.log_file.typed(line)
+        call = self.call
+        if call is None or call.state != 'established':
+            print('* not in a call')
+            return
+        call.send_message(line)
+
+    def _input(self, line):
+        if not line:
+            return
+        if getattr(self, 'log_file', None) is not None:
+            self.log_file.typed(line)
+        call = self.call
+        if line.startswith('/'):
+            command, _, rest = line[1:].partition(' ')
+            command, rest = command.lower(), rest.strip()
+            if command in ('quit', 'exit', 'q'):
+                reactor.stop()
+            elif command in ('answer', 'a'):
+                self.answer()
+            elif command in ('reject', 'r') and call is not None:
+                call.reject()
+            elif command in ('hangup', 'h', 'bye') and call is not None:
+                call.hangup()
+            elif command == 'call' and rest:
+                if self.account is None:
+                    print('* not connected yet')
+                else:
+                    self.place_call(addresses([rest], self.account_info.domain)[0])
+            elif command == 'mute' and call is not None:
+                call.set_audio_muted(True)
+            elif command == 'unmute' and call is not None:
+                call.set_audio_muted(False)
+            elif command == 'stats':
+                if call is None or call.state != 'established':
+                    print('* not in a call')
+                else:
+                    self.statistics.log()
+            elif command == 'dtmf' and call is not None and rest:
+                if not call.send_dtmf(rest.replace(' ', '')):
+                    print('* not in a call')
+            else:
+                print('* /answer, /reject, /hangup, /call user[@domain], /mute, /unmute, /dtmf DIGITS, /stats, /quit; anything else goes to the far end as a message')
+            return
+        if call is None or call.state != 'established':
+            print('* not in a call')
+            return
+        call.send_message(line)
+
+
+def main():
+    arguments = parse_arguments()
+    setup_logging(arguments)
+    log_file = start_log_file('sylk-session')
+    client = SylkCall(arguments)
+    client.log_file = log_file
+    client.console = None
+    if not arguments.no_input and sys.stdin.isatty():
+        client.console = Console(client)
+        stdio.StandardIO(client.console)
+        reactor.callWhenRunning(client.resume_keys)
+    reactor.addSystemEventTrigger('before', 'shutdown', client.leave)     # SIGTERM (and the second Ctrl-C) stop the reactor
+
+    def install_sigint():
+        # after the reactor's own handlers: Ctrl-C hangs up first, quits the second time
+        signal.signal(signal.SIGINT, lambda signum, frame: reactor.callFromThread(client.interrupt))
+    reactor.callWhenRunning(install_sigint)
+    reactor.callWhenRunning(client.start)
+    reactor.run()
+
+
+if __name__ == '__main__':
+    main()

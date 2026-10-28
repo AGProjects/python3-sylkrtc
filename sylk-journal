@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+
+# Copyright (C) 2026 AG Projects (https://ag-projects.com)
+# Licensed under the GNU General Public License, version 3 or later (see LICENSE).
+
+"""The account's message journal on SylkServer, the history the clients sync from.
+
+    sylk-journal                      summary: how many entries, of which content types, in and
+                                      out, the oldest and the newest (counted by the server,
+                                      nothing is downloaded)
+    sylk-journal contacts             per contact: entries in and out, all content types
+    sylk-journal type TYPE [-n N]     one content type, per contact (TYPE: text/plain, or part of
+                                      a name: location, imdn, file-transfer)
+    sylk-journal files                the files the server keeps for the account: sent and
+                                      received, by type, size and age, the largest conversations,
+                                      and when the server removes them
+
+The journal is reached over HTTPS with the account's API token, as sylk-account does: taken
+from a client that keeps it (Blink: ~/.blink/config), or given with --token.
+"""
+
+import argparse
+import base64
+import hashlib
+import json
+import logging
+from datetime import datetime
+
+from sylkrtc.serverapi import ServerAPI
+
+
+PROGRAM = 'sylk-journal'
+
+COMMANDS = {(): 'summary', ('summary',): 'summary', ('files',): 'files', ('contacts',): 'contacts', ('type',): 'type'}
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='The account\'s message journal on SylkServer.',
+                                     formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__.split('\n\n', 1)[1])
+    parser.add_argument('command', nargs='*', help='what to do (see below); default: the summary')
+    parser.add_argument('-d', '--config-dir', help='the folder whose config file holds the account (default: ~/.sylkclient/, else ~/.sipclient/ or ~/.blink/)')
+    parser.add_argument('-a', '--account', help='the account (default: the default account)')
+    parser.add_argument('--token', help='the API token (default: the one a client keeps for the account)')
+    parser.add_argument('-n', '--limit', type=int, default=0, metavar='N', help='contacts, type: only the N with the most entries')
+    parser.add_argument('-j', '--json', action='store_true', help='print the server\'s answer as it is')
+    parser.add_argument('-v', '--verbose', '--debug', dest='debug', action='store_true', help='log debug messages')
+    arguments = parser.parse_intermixed_args()
+    words = list(arguments.command)
+    for size in (1, 0):
+        key = tuple(word.lower() for word in words[:size])
+        if key in COMMANDS:
+            arguments.action, arguments.args = COMMANDS[key], words[size:]
+            break
+    else:
+        parser.error(f'unknown command: {" ".join(words)}')
+    wanted = 1 if arguments.action == 'type' else 0
+    if len(arguments.args) != wanted:
+        parser.error('usage: sylk-journal type TYPE' if wanted else f'{arguments.action} takes no argument')
+    return arguments
+
+
+def day(text):
+    """An ISO time as a local date and time, or '-'."""
+    if not text:
+        return '-'
+    try:
+        value = datetime.fromisoformat(str(text).replace('Z', '+00:00'))
+    except ValueError:
+        return str(text)
+    if value.tzinfo is not None:
+        value = value.astimezone()
+    return value.strftime('%Y-%m-%d %H:%M')
+
+
+def table(header, rows, right=()):
+    widths = [max(len(str(cell)) for cell in column) for column in zip(header, *rows)]
+
+    def line(cells):
+        return '  '.join(str(cell).rjust(width) if index in right else str(cell).ljust(width)
+                         for index, (cell, width) in enumerate(zip(cells, widths))).rstrip()
+    print(line(header))
+    print(line('-' * width for width in widths))
+    for row in rows:
+        print(line(row))
+
+
+def size(count):
+    for unit, step in (('GB', 1 << 30), ('MB', 1 << 20), ('KB', 1 << 10)):
+        if count >= step:
+            return f'{count / step:.1f} {unit}'
+    return f'{count} B'
+
+
+def hashed(uri):
+    """The folder name the server used for an address before it used the address itself:
+    urlsafe base64 of its md5, unpadded."""
+    return base64.urlsafe_b64encode(hashlib.md5(uri.encode('utf-8')).digest()).rstrip(b'=\n').decode()
+
+
+def unhash_names(api, names):
+    """{folder name: address} for the hashed names among these, found among the contacts of the
+    journal (hashed both as user@domain and as sip:user@domain); a hash of nobody there becomes
+    '<hash> (hashed)'. Nothing to ask the server when no name is hashed."""
+    names = [name for name in names if '@' not in name]
+    if not names:
+        return {}
+    known = {}
+    for contact in summary(api).get('by_contact') or {}:
+        for uri in (contact, 'sip:' + contact):
+            known[hashed(uri)] = contact
+    return {name: known.get(name, f'{name} (hashed)') for name in names}
+
+
+def show_files(api, as_json):
+    data = api.request('GET', f'transfers/summary/{api.quoted_account}', timeout=(15, 300)).json()
+    if as_json:
+        print(json.dumps(data, indent=2))
+        return
+    sent, received, expiry = data.get('sent') or {}, data.get('received') or {}, data.get('expiry') or {}
+    print(f'Files of {data.get("account")} on the server')
+    if expiry:
+        print(f'(the server removes a file after {expiry.get("days")} days, after {expiry.get("large_days")} days '
+              f'when it is {size(expiry.get("large_bytes") or 0)} or more)')
+    print()
+    table(('', 'Files', 'Size', 'Oldest', 'Newest'),
+          [(label, f'{part.get("files", 0):,}', size(part.get('bytes', 0)), day(part.get('oldest')), day(part.get('newest')))
+           for label, part in (('Sent', sent), ('Received', received))]
+          + [('Total', f'{sent.get("files", 0) + received.get("files", 0):,}', size(sent.get('bytes', 0) + received.get('bytes', 0)), '', '')],
+          right=(1, 2))
+    kinds = [kind for kind in ('image', 'video', 'audio', 'file')
+             if (sent.get('by_type') or {}).get(kind, {}).get('files') or (received.get('by_type') or {}).get(kind, {}).get('files')]
+    if kinds:
+        print()
+        rows = []
+        for kind in kinds:
+            mine, theirs = (sent.get('by_type') or {}).get(kind, {}), (received.get('by_type') or {}).get(kind, {})
+            rows.append((kind, f'{mine.get("files", 0):,}', size(mine.get('bytes', 0)), f'{theirs.get("files", 0):,}', size(theirs.get('bytes', 0))))
+        table(('Type', 'Sent', 'Size', 'Received', 'Size'), rows, right=(1, 2, 3, 4))
+    names = unhash_names(api, [entry['contact'] for part in (sent, received) for entry in part.get('contacts') or []])
+    contacts = {}
+    for direction, part in (('sent', sent), ('received', received)):
+        for entry in part.get('contacts') or []:
+            item = contacts.setdefault(names.get(entry['contact'], entry['contact']), {'sent': 0, 'received': 0, 'bytes': 0})
+            item[direction] += entry['files']
+            item['bytes'] += entry['bytes']
+    if contacts:
+        print('\nThe largest conversations')
+        rows = [(contact, f'{item["sent"]:,}', f'{item["received"]:,}', size(item['bytes']))
+                for contact, item in sorted(contacts.items(), key=lambda pair: -pair[1]['bytes'])[:10]]
+        table(('Contact', 'Sent', 'Received', 'Size'), rows, right=(1, 2, 3))
+
+
+def summary(api, content_types=None):
+    params = [('content_type', content_type) for content_type in content_types or ()]
+    return api.request('GET', f'messages/summary/{api.quoted_account}', params=params, timeout=(15, 300)).json()
+
+
+def resolve_type(api, name):
+    """The content type meant: as given when it has a /, else the one of the journal whose name has it."""
+    if '/' in name:
+        return name.lower()
+    found = [content_type for content_type in (summary(api).get('by_type') or {}) if name.lower() in content_type]
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        raise SystemExit(f'no content type in the journal has "{name}" in its name')
+    raise SystemExit(f'"{name}" is in several content types: {", ".join(found)}')
+
+
+def contact_rows(by_contact, limit):
+    items = sorted(by_contact.items(), key=lambda pair: -pair[1]['total'])
+    shown = items[:limit] if limit else items
+    rows = [(contact, f'{item["total"]:,}', f'{item["in"]:,}', f'{item["out"]:,}') for contact, item in shown]
+    if len(shown) < len(items):
+        rest = items[len(shown):]
+        rows.append((f'{len(rest)} more', f'{sum(item["total"] for _, item in rest):,}', f'{sum(item["in"] for _, item in rest):,}',
+                     f'{sum(item["out"] for _, item in rest):,}'))
+    return rows
+
+
+def show_contacts(api, content_type, limit, as_json):
+    data = summary(api, [content_type] if content_type else None)
+    if as_json:
+        print(json.dumps(data, indent=2))
+        return
+    total = data.get('total') or 0
+    what = content_type or 'entries'
+    print(f'{total:,} {what} of {data.get("account")} with {data.get("conversations") or 0:,} contacts, '
+          f'from {day(data.get("oldest"))} to {day(data.get("newest"))}\n')
+    by_contact = data.get('by_contact') or {}
+    if not by_contact:
+        print('None')
+        return
+    rows = contact_rows(by_contact, limit)
+    rows.append(('total', f'{total:,}', f'{sum(item["in"] for item in by_contact.values()):,}', f'{sum(item["out"] for item in by_contact.values()):,}'))
+    table(('Contact', 'Entries', 'In', 'Out'), rows, right=(1, 2, 3))
+
+
+def show_summary(api, as_json):
+    data = summary(api)
+    if as_json:
+        print(json.dumps(data, indent=2))
+        return
+    total = data.get('total') or 0
+    print(f'Journal of {data.get("account")}: {total:,} entries in {data.get("conversations") or 0:,} conversations')
+    print(f'From {day(data.get("oldest"))} to {day(data.get("newest"))} ({data.get("backend")} storage)\n')
+    by_type = data.get('by_type') or {}
+    if not by_type:
+        print('Nothing in it')
+        return
+    rows = [(content_type, f'{item["total"]:,}', f'{100.0 * item["total"] / total:.1f}%' if total else '-', f'{item["in"]:,}', f'{item["out"]:,}')
+            for content_type, item in sorted(by_type.items(), key=lambda pair: -pair[1]['total'])]
+    rows.append(('total', f'{total:,}', '100%', f'{sum(item["in"] for item in by_type.values()):,}',
+                 f'{sum(item["out"] for item in by_type.values()):,}'))
+    table(('Content type', 'Entries', 'Share', 'In', 'Out'), rows, right=(1, 2, 3, 4))
+
+
+def main():
+    arguments = parse_arguments()
+    logging.basicConfig(format='%(name)s: %(message)s')       # a no-op where the SDK's log handler is installed
+    logging.getLogger().setLevel(logging.DEBUG if arguments.debug else logging.WARNING)
+    api = ServerAPI.connect(PROGRAM, arguments.account, arguments.config_dir, arguments.token)
+    if arguments.action == 'summary':
+        show_summary(api, arguments.json)
+    elif arguments.action == 'files':
+        show_files(api, arguments.json)
+    elif arguments.action == 'contacts':
+        show_contacts(api, None, arguments.limit, arguments.json)
+    elif arguments.action == 'type':
+        show_contacts(api, resolve_type(api, arguments.args[0]), arguments.limit, arguments.json)
+
+
+if __name__ == '__main__':
+    main()
