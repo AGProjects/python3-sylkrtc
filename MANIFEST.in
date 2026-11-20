@@ -10,6 +10,8 @@ include sylk-conference
 include sylk-journal
 include sylk-session
 include sylk-settings
+include mac/*.sh
+include mac/requirements-python.txt
 include debian/changelog
 include debian/compat
 include debian/control

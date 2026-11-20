@@ -46,14 +46,13 @@ def device_id():
     global _device_id
     if _device_id is not None:
         return _device_id
-    from sipsimple.configuration.backend import ConfigurationBackendError
-    from sipsimple.configuration.backend.file import FileBackend
+    from sylkrtc.configfile import ConfigFile, ConfigFileError
     path = os.path.join(DIRECTORY, 'config')
     try:
         os.makedirs(DIRECTORY, exist_ok=True)
         with open(os.path.join(DIRECTORY, '.device_id.lock'), 'w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            backend = FileBackend(path)
+            backend = ConfigFile(path)
             data = backend.load()
             general = data.setdefault('SylkSettings', {})
             value = str(general.get('device_id') or '').strip()
@@ -62,7 +61,7 @@ def device_id():
                 general['device_id'] = value
                 backend.save(data)
                 log.info(f'device id {value} kept in {path}')
-    except (OSError, ConfigurationBackendError) as e:
+    except (OSError, ConfigFileError) as e:
         # not kept: this run is a device of its own, the next one tries again
         value = _legacy_id() or str(uuid.uuid4())
         log.warning(f'cannot keep the device id in {path}: {e}')

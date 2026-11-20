@@ -93,6 +93,32 @@ reactor thread and posts its notifications there; logging goes to the 'sylkrtc'
 logger, for the client to forward to its own log.
 
 
+macOS
+-----
+
+sylk-account, sylk-journal and sylk-addressbook run on macOS without the SIP
+SIMPLE SDK: the configuration files are read and the device id written with
+sylkrtc.configfile, the SDK's file format without the SDK. sylk-settings still
+needs python3-sipsimple. The scripts in mac/ install them in a virtualenv,
+~/work/sylkrtc-python-<ver>-<arch>-env, as python3-sipsimple's mac/ does:
+
+    cd mac
+    bash 01-install-build-env.sh        (checks only)
+    bash 03-install-python-deps.sh      (the venv, requirements-python.txt)
+    bash 04-install-sylkrtc.sh          (this checkout, then a check of the tools)
+    . activate_venv.sh
+
+python3-application comes from its release tag on GitHub: the one on PyPI is
+too old. SYLKRTC_VENV=<path> installs in another venv instead, e.g.
+python3-sipsimple's, where sylk-settings works too.
+
+Blink's configuration is found in ~/Library/Application Support/Blink (also
+Blink Pro, Blink Lite, SIP2SIP). Blink keeps the account passwords in the login
+keychain: they are read with security(1), item "Blink (<account>)", when a tool
+needs one (sylk-addressbook, not sylk-account or sylk-journal, which use the API
+token); macOS asks once to allow it.
+
+
 The tools as a device
 ---------------------
 

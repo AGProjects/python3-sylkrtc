@@ -4,23 +4,45 @@
 """The accounts of a SIP SIMPLE configuration, read only.
 
 The sylk clients (~/.sylkclient/config, managed with sylk-settings), the SIP SIMPLE
-clients (~/.sipclient/config) and Blink (~/.blink/config) keep their accounts in the
-same file format, the SDK's file backend. Read without starting the SIP engine; of
+clients (~/.sipclient/config) and Blink (~/.blink/config; on macOS
+~/Library/Application Support/Blink/config) keep their accounts in the same file
+format, the SDK's file backend, read here without the SDK (sylkrtc.configfile). Of
 the other clients' only the credentials are used, and nothing is written there.
+
+Blink for macOS keeps the passwords in the login keychain (the config file says
+"keychain"): they are read from there with security(1) when used, which macOS may
+ask to allow once.
 """
 
 import os
 import re
+import subprocess
+import sys
 
-from sipsimple.configuration.backend import ConfigurationBackendError
-from sipsimple.configuration.backend.file import FileBackend
+from sylkrtc.configfile import ConfigFile, ConfigFileError
 
 
 __all__ = ['DEFAULT_DIRECTORY', 'SEARCH_DIRECTORIES', 'ConfigError', 'find_directory', 'load', 'Account', 'accounts', 'find_account', 'locate_account', 'api_token', 'SylkConfiguration']
 
 
 DEFAULT_DIRECTORY = os.path.expanduser('~/.sylkclient')
-SEARCH_DIRECTORIES = [DEFAULT_DIRECTORY, os.path.expanduser('~/.sipclient'), os.path.expanduser('~/.blink')]
+BLINK_MACOS_DIRECTORIES = [os.path.expanduser(f'~/Library/Application Support/{name}') for name in ('Blink', 'Blink Pro', 'Blink Lite', 'SIP2SIP')]
+
+
+def _search_directories():
+    candidates = [DEFAULT_DIRECTORY, os.path.expanduser('~/.sipclient'), os.path.expanduser('~/.blink')]
+    if sys.platform == 'darwin':
+        candidates += BLINK_MACOS_DIRECTORIES
+    directories, seen = [], set()
+    for directory in candidates:
+        real = os.path.realpath(directory)      # ~/.blink may be a link to Blink's folder on macOS: one entry
+        if real not in seen:
+            seen.add(real)
+            directories.append(directory)
+    return directories
+
+
+SEARCH_DIRECTORIES = _search_directories()
 
 
 def find_directory():
@@ -38,8 +60,8 @@ class ConfigError(Exception):
 def load(directory=DEFAULT_DIRECTORY):
     """The configuration in <directory>/config as nested dicts ({} when there is none)."""
     try:
-        return FileBackend(os.path.join(directory, 'config')).load()
-    except ConfigurationBackendError as e:
+        return ConfigFile(os.path.join(directory, 'config')).load()
+    except ConfigFileError as e:
         raise ConfigError(str(e))
 
 
@@ -49,19 +71,45 @@ def _bool(value, default):
     return str(value).lower() in ('true', 'yes', 'on', '1')
 
 
+KEYCHAIN = 'keychain'     # Blink for macOS: the password is in the login keychain
+
+
+def keychain_password(service, account):
+    """A generic password of the login keychain (macOS), '' when there is none or it cannot be read."""
+    try:
+        result = subprocess.run(['security', 'find-generic-password', '-s', service, '-a', account, '-w'],
+                                capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return ''
+    return result.stdout.rstrip('\n') if result.returncode == 0 else ''
+
+
 class Account(object):
-    def __init__(self, id, data, settings):
+    def __init__(self, id, data, settings, directory=None):
         self.id = id
         self.username, _, self.domain = id.partition('@')
         self.enabled = _bool(data.get('enabled'), False)
         self.display_name = data.get('display_name') or ''
         auth = data.get('auth') or {}
         self.auth_username = auth.get('username') or self.username
-        self.password = auth.get('password') or ''
+        self._password = auth.get('password') or ''
+        self.directory = directory
         tls = settings.get('tls') or {}
         self.verify_tls = _bool(tls.get('verify_server'), False)
         self.instance_id = settings.get('instance_id') or None
         self.user_agent = settings.get('user_agent') or None
+
+    @property
+    def has_password(self):
+        return bool(self._password)
+
+    @property
+    def password(self):
+        if self._password == KEYCHAIN:
+            # Blink for macOS: the item is "<application> (<account>)", the application being its data folder's name
+            application = os.path.basename(os.path.normpath(os.path.realpath(self.directory or '')))
+            self._password = keychain_password(f'{application} ({self.id})', self.id) if sys.platform == 'darwin' else ''
+        return self._password
 
     def __repr__(self):
         return f'<Account {self.id}>'
@@ -71,7 +119,7 @@ def accounts(directory=DEFAULT_DIRECTORY):
     """(accounts, default account id) of the configuration; Bonjour is left out."""
     data = load(directory)
     settings = data.get('SIPSimpleSettings') or {}
-    found = [Account(id, entry or {}, settings) for id, entry in sorted((data.get('Accounts') or {}).items())
+    found = [Account(id, entry or {}, settings, directory) for id, entry in sorted((data.get('Accounts') or {}).items())
              if id != 'bonjour@local' and re.match(r'^[^@\s]+@[^@\s]+$', id)]
     return found, settings.get('default_account')
 
@@ -101,7 +149,7 @@ def find_account(name=None, directory=DEFAULT_DIRECTORY):
 
 def locate_account(name=None, directory=None):
     """(account, directory) of the account to use, searched in directory when one is given, else in every
-    configuration in the order of SEARCH_DIRECTORIES (~/.sylkclient, ~/.sipclient, ~/.blink):
+    configuration in the order of SEARCH_DIRECTORIES (~/.sylkclient, ~/.sipclient, ~/.blink, Blink's on macOS):
 
     - name given: its exact address in the first configuration that has it, else the only account
       (in all of them) whose address contains it;
@@ -126,7 +174,7 @@ def locate_account(name=None, directory=None):
         if len(partial) == 1:
             return next(iter(partial.values()))
         raise ConfigError(f'account {name} not found' if not partial else f'account {name} is ambiguous: {", ".join(sorted(partial))}')
-    usable = [(account, candidate, default) for account, candidate, default in found if account.enabled and account.password]
+    usable = [(account, candidate, default) for account, candidate, default in found if account.enabled and account.has_password]
     for account, candidate, default in usable:
         if account.id == default:
             return account, candidate

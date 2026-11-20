@@ -31,11 +31,12 @@ setup(
         'Development Status :: 4 - Beta',
         'Intended Audience :: Developers',
         'Operating System :: POSIX :: Linux',
+        'Operating System :: MacOS :: MacOS X',
         'Programming Language :: Python',
         'Topic :: Communications :: Conferencing',
     ],
 
     packages=['sylkrtc'],
     scripts=['sylk-account', 'sylk-addressbook', 'sylk-conference', 'sylk-journal', 'sylk-session', 'sylk-settings'],
-    install_requires=['python3-application', 'twisted', 'autobahn', 'dnspython', 'requests', 'zope.interface'],
+    install_requires=['python3-application>=3.0', 'twisted[tls]', 'autobahn', 'dnspython', 'requests', 'zope.interface'],
 )
