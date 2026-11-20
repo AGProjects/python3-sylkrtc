@@ -343,6 +343,13 @@ class Call(object):
         self._establish_timer.stop()
         self.reason = reason
         self.code = code
+        if self.media is not None and self.state in ('accepted', 'early-media'):
+            try:
+                from sylkrtc.gst import connection_state
+                state = connection_state(getattr(self.media, 'webrtcbin', None))
+            except Exception:
+                state = ''
+            self.log('ended before the media connection was up' + (f' ({state})' if state else ''), 'warning')
         if self.media is not None:
             NotificationCenter().post_notification('SylkRTCCallWillTerminate', sender=self)     # the media is still there
             try:

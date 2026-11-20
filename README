@@ -251,7 +251,9 @@ commands) as "> text".
 It leaves the room and exits 10 minutes after getting in (--auto-disconnect
 SECONDS, 0 to stay, as a camera bridge run by systemd would).
 
-Typed lines go to the room's chat; /mute, /unmute, /hand, /who, /invite user[@domain] ..., /quit.
+Typed lines go to the room's chat; /mute, /unmute, /hand, /who, /invite user[@domain] ..., /quit;
+/devices lists the audio devices, /input [N] and /output [N] switch to the next
+(or the Nth) microphone and speakers, also during the call; r (or /rtp) logs RTP statistics and audio levels (RMS and peak dBFS) of every stream every 2 s, again to stop.
 Without a terminal (--no-input, or run by systemd) it only joins, publishes and
 logs. A room that ends or a connection that drops is joined again; a camera that
 fails is started again, both with a growing delay up to a minute.
@@ -291,7 +293,9 @@ c call someone (then type user or user@domain), / type a command, q quit. A call
 ringing in: y accept, n reject; one ringing in during a call asks the same, y
 hanging up the current call first. Calling: x hang up. In a call: m mute/unmute,
 s RTP statistics (per stream rate, bytes, round trip time, loss, then the
-totals), i call info, x hang up, 0-9 * # DTMF (SIP INFO), Enter to type a message
+totals), r RTP statistics and audio levels (RMS and peak dBFS) logged every 2 s,
+again to stop, d the audio devices, a the next microphone, o the next speakers
+(also when not in a call, for the next one), i call info, x hang up, 0-9 * # DTMF (SIP INFO), Enter to type a message
 to the far end. The commands typed after /: /answer, /reject, /hangup,
 /call user[@domain], /mute, /unmute, /dtmf DIGITS, /stats, /quit. A call
 placed from the command line exits when it ends; waiting for calls goes on after

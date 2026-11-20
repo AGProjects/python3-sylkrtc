@@ -163,6 +163,67 @@ def addresses(texts, domain):
     return found
 
 
+# Audio devices
+
+class AudioChoice(object):
+    """The microphone (input) and speakers (output) to use: the configured one (0: auto, the system default, unless
+    configured otherwise), then every device the system has now (1, 2, ...)."""
+
+    TITLES = {'input': 'microphone', 'output': 'speakers'}
+
+    def __init__(self, audio_input, audio_output):
+        self.configured = {'input': audio_input or 'auto', 'output': audio_output or 'auto'}
+        self.chosen = dict(self.configured)
+
+    @staticmethod
+    def describe(option):
+        if isinstance(option, str):
+            return 'system default (auto)' if option in ('', 'auto') else option
+        return option.name + (' (system default)' if option.default else '')
+
+    def options(self, kind):
+        from sylkrtc.gst import audio_devices
+        inputs, outputs = audio_devices()
+        return [self.configured[kind]] + (inputs if kind == 'input' else outputs)
+
+    def _index(self, options, kind):
+        current = self.chosen[kind]
+        for index, option in enumerate(options):
+            if option is current or (type(option) is type(current) and str(option) == str(current)):
+                return index
+        return 0
+
+    def current(self, kind):
+        return self.describe(self.chosen[kind])
+
+    def lines(self):
+        lines = []
+        for kind in ('input', 'output'):
+            options = self.options(kind)
+            chosen = self._index(options, kind)
+            lines.append(f'{self.TITLES[kind]}:')
+            lines += [f'  {"*" if index == chosen else " "} {index} {self.describe(option)}' for index, option in enumerate(options)]
+        return lines
+
+    def select(self, kind, number=None):
+        """The option numbered so, or (None) the next one, chosen: it is returned. ValueError for no such number."""
+        options = self.options(kind)
+        index = (self._index(options, kind) + 1) % len(options) if number is None else number
+        if not 0 <= index < len(options):
+            raise ValueError(f'no {self.TITLES[kind]} {number} (0-{len(options) - 1})')
+        self.chosen[kind] = options[index]
+        return options[index]
+
+    def apply(self, media, kind):
+        """The chosen one used by media (a RoomMedia or CallMedia, possibly running): a message to show."""
+        if media is not None and hasattr(media, 'set_audio_device'):
+            try:
+                media.set_audio_device(kind, self.chosen[kind])
+            except Exception as e:
+                return f'{self.TITLES[kind]}: cannot use {self.current(kind)}: {e}'
+        return f'{self.TITLES[kind]}: {self.current(kind)}'
+
+
 # Statistics
 
 def human_bytes(count):
@@ -182,11 +243,25 @@ def loss(lost, total):
     return f'{100.0 * lost / total:.1f}%' if total else '-'
 
 
+def meter(level, width=20, floor=-60.0):
+    """(RMS dBFS, peak dBFS) as a bar from floor to 0 dBFS (= RMS, | peak) and the numbers."""
+    rms, peak = level
+    if peak <= -99:
+        return 'silent'
+    filled = int(round(width * min(1.0, max(0.0, (rms - floor) / -floor))))
+    mark = min(width - 1, int(width * min(1.0, max(0.0, (peak - floor) / -floor))))
+    bar = ['='] * filled + [' '] * (width - filled)
+    if peak > floor:
+        bar[mark] = '|'
+    return f'[{"".join(bar)}] rms {rms:.0f} peak {peak:.0f} dBFS'
+
+
 class Statistics(object):
     """The traffic of a session's streams (its media's stats(): [(label, direction, stats)]): sampled every
     SAMPLE_INTERVAL s, logged every interval s, summed on leaving (earlier connections of the same run included)."""
 
     SAMPLE_INTERVAL = 5
+    LIVE_INTERVAL = 2
 
     def __init__(self, interval):
         self.interval = interval
@@ -197,6 +272,9 @@ class Statistics(object):
         self.started = None
         self._sampler = None
         self._logger = None
+        self.live = False
+        self._live = None
+        self._live_previous = {}    # (label, direction) -> (bytes, packets, lost, time) at the last live line
 
     def start(self, session):
         """A connection is established."""
@@ -219,7 +297,7 @@ class Statistics(object):
         self.samples, self.session = {}, None
 
     def stop(self):
-        for timer in (self._sampler, self._logger):
+        for timer in (self._sampler, self._logger, self._live):
             if timer is not None:
                 timer.stop()
 
@@ -248,6 +326,64 @@ class Statistics(object):
     def log(self):
         for line in self.lines():
             log.info('stats: ' + line)
+
+    def toggle_live(self):
+        """Log every LIVE_INTERVAL s each stream's RTP statistics and audio level, or stop doing so: whether it now does."""
+        from sylkrtc.util import RepeatingTimer
+        self.live = not self.live
+        if self.live:
+            self._live_previous = {}
+            self._live = self._live or RepeatingTimer(self.LIVE_INTERVAL, self.log_live)
+            self._live.start(0)
+        elif self._live is not None:
+            self._live.stop()
+        return self.live
+
+    def log_live(self):
+        """One line per stream: rate and packets per second since the last line, bytes, loss, jitter, round trip time
+        and its audio level (RMS and peak since the last line)."""
+        session = self.session
+        media = getattr(session, 'media', None)
+        if session is None or session.state != 'established' or getattr(media, 'pipeline', None) is None:
+            return
+        try:
+            streams = media.stats()
+            levels = media.levels() if hasattr(media, 'levels') else {}
+        except Exception as e:
+            log.debug(f'statistics: {e}')
+            return
+        now = reactor.seconds()
+        for label, direction, stats in sorted(streams, key=lambda item: (item[1] != 'out', item[0])):
+            key = (label, direction)
+            self.samples[key] = stats
+            if direction == 'out':
+                count, packets, lost = stats['sent_bytes'], stats['sent_packets'], 0
+            else:
+                count, packets, lost = stats['received_bytes'], stats['received_packets'], stats['lost_received']
+            before = self._live_previous.get(key)
+            self._live_previous[key] = (count, packets, lost, now)
+            part = f'{label} {direction}'
+            if before is not None:
+                elapsed = max(1e-3, now - before[3])
+                new_packets, new_lost = max(0, packets - before[1]), max(0, lost - before[2])
+                part += f' {human_rate(8.0 * max(0, count - before[0]) / elapsed)} {new_packets / elapsed:.0f} pkt/s'
+            part += f' {human_bytes(count)}'
+            if direction == 'out':
+                if stats['fraction_lost_sent'] is not None:
+                    part += f' loss {100.0 * stats["fraction_lost_sent"]:.1f}%'
+                if stats.get('jitter_sent') is not None:
+                    part += f' jitter {stats["jitter_sent"] * 1000:.0f} ms'
+                if stats['rtt'] is not None:
+                    part += f' rtt {stats["rtt"] * 1000:.0f} ms'
+            else:
+                if before is not None:
+                    part += f' loss {loss(new_lost, new_packets + new_lost)}'
+                if stats.get('jitter_received') is not None:
+                    part += f' jitter {stats["jitter_received"] * 1000:.0f} ms'
+            level = levels.get(key)
+            if level is not None:
+                part += ' ' + meter(level)
+            log.info('rtp: ' + part)
 
     def lines(self):
         """What the streams carry now: one line per stream (rate since the last report, bytes,
@@ -369,12 +505,33 @@ class _Tee(object):
         self.log_file = log_file
 
     def write(self, text):
-        self.stream.write(text)
+        # the terminal can be non-blocking (Twisted's stdio sets it for stdin, which shares it): wait instead of losing
+        # what does not fit at once (a long SDP)
+        rest = text
+        while True:
+            try:
+                self.stream.write(rest)
+                break
+            except BlockingIOError as e:
+                rest = rest[getattr(e, 'characters_written', 0):]
+                self._wait()
         self.log_file.record(text, self)
         return len(text)
 
     def flush(self):
-        self.stream.flush()
+        while True:
+            try:
+                self.stream.flush()
+                return
+            except BlockingIOError:
+                self._wait()
+
+    def _wait(self):
+        try:
+            import select
+            select.select([], [self.stream.fileno()], [], 1)
+        except Exception:
+            time.sleep(0.01)
 
     def __getattr__(self, name):
         return getattr(self.stream, name)

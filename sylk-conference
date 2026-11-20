@@ -39,7 +39,7 @@ from twisted.internet.task import deferLater
 from zope.interface import implementer
 
 from sylkrtc import sipconfig
-from sylkrtc.cli import (Console, Statistics, addresses, report_discovery, report_server_info, select_cameras,
+from sylkrtc.cli import (AudioChoice, Console, Statistics, addresses, report_discovery, report_server_info, select_cameras,
                          setup_logging, start_log_file, take_room_from_cameras)
 from sylkrtc.discovery import Discovery
 from sylkrtc.rooms import RoomTarget, parse_room, configuration_domain
@@ -152,6 +152,7 @@ class SylkConference(object):
         self.attempt = 0
         self.stopping = False
         self.statistics = Statistics(arguments.stats_interval)
+        self.audio = AudioChoice(self.audio_input, self.audio_output)
         NotificationCenter().add_observer(self)
 
     # Start
@@ -170,6 +171,7 @@ class SylkConference(object):
             log.error('missing: ' + ', '.join(f'{what} (install {package})' for what, package in missing))
             reactor.stop()
             return
+        print('\n'.join(f'* {line}' for line in self.audio.lines()))
         log.info(f'account {self.account.id} (from {os.path.join(self.config_dir, "config")}), room {self.room_text}'
                  + (f' (session {self.configuration_session["name"]})' if self.configuration_session else '')
                  + (f', our video {self.main_camera[0]}' if self.main_camera else '')
@@ -231,7 +233,7 @@ class SylkConference(object):
             return
         from sylkrtc.gst import MediaFactory
         self.session = VideoroomSession(self.identity, self.target.video_uri, self.target.ws_server,
-                                        MediaFactory(audio_input=self.audio_input, audio_output=self.audio_output,
+                                        MediaFactory(audio_input=self.audio.chosen['input'], audio_output=self.audio.chosen['output'],
                                                      video_source=self.main_camera[1] if self.main_camera else None),
                                         ice_servers=self.target.ice_servers, guest_domain=self.target.guest_domain if self.remote else None,
                                         audio=not self.muted, video=self.main_camera is not None, receive_video=False, user_agent=USER_AGENT,
@@ -361,6 +363,9 @@ class SylkConference(object):
         if getattr(self, 'log_file', None) is not None:
             self.log_file.typed(line)
         session = self.session
+        if line.lower() in ('r', '/r', '/rtp'):
+            print(f'* RTP statistics and audio levels every {self.statistics.LIVE_INTERVAL} s' if self.statistics.toggle_live() else '* RTP statistics off')
+            return
         if line.startswith('/'):
             command, _, rest = line[1:].partition(' ')
             command = command.lower()
@@ -370,6 +375,16 @@ class SylkConference(object):
                 session.set_audio_muted(True)
             elif command == 'unmute' and session is not None:
                 session.set_audio_muted(False)
+            elif command in ('devices', 'd'):
+                print('\n'.join(f'* {line}' for line in self.audio.lines()))
+            elif command in ('input', 'output', 'a', 'o'):
+                kind = 'input' if command in ('input', 'a') else 'output'
+                try:
+                    self.audio.select(kind, int(rest) if rest.strip() else None)
+                except ValueError as e:
+                    print(f'* {e}')
+                    return
+                print('* ' + self.audio.apply(session.media if session is not None and session.state not in ('idle', 'terminated') else None, kind))
             elif command == 'hand' and session is not None:
                 session.toggle_hand()
             elif command == 'invite' and session is not None and rest.strip():
@@ -385,7 +400,7 @@ class SylkConference(object):
                     how = (' (relayed)' if media.relay else ' (encoded)') if media is not None and extra.state == 'established' else ''
                     print(f'* our {extra.label}: {extra.state}{how}{sent}')
             else:
-                print('* /mute, /unmute, /hand, /who, /invite user@domain ..., /quit; anything else goes to the chat')
+                print('* /mute, /unmute, /hand, /who, /invite user@domain ..., r (/rtp) RTP statistics and audio levels every 2 s on/off, /devices (/d), /input [N] (/a), /output [N] (/o) the next or Nth microphone/speakers, /quit; anything else goes to the chat')
             return
         if session is None or session.state != 'established':
             print('* not in the room')

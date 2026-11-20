@@ -26,14 +26,16 @@ thread safe entry points.
 """
 
 import logging
+import math
 import random
 import re
+import threading
 import time
 
-from sylkrtc.sdp import chosen_video_codec, cvo_id, has_media, ice_urls, mids, offered_codecs, with_cvo
+from sylkrtc.sdp import chosen_video_codec, complete_answer, cvo_id, has_media, ice_urls, mids, offered_codecs, with_cvo
 
 
-__all__ = ['MediaFactory', 'RoomMedia', 'ExtraMedia', 'CallMedia', 'VideoFrame', 'media_missing', 'media_report', 'RESOLUTIONS', 'parse_resolution', 'webrtcbin_stats']
+__all__ = ['MediaFactory', 'RoomMedia', 'ExtraMedia', 'CallMedia', 'VideoFrame', 'media_missing', 'media_report', 'AudioDevice', 'audio_devices', 'RESOLUTIONS', 'parse_resolution', 'webrtcbin_stats']
 
 
 log = logging.getLogger('sylkrtc.gst')
@@ -90,7 +92,7 @@ def _init():
     if _gi_error is not None:
         return False
     if not Gst.is_initialized():
-        Gst.init(None)
+        Gst.init([])
     return True
 
 
@@ -116,6 +118,97 @@ def media_report():
                       'H264 relay %s' % ('yes' if _has('rtph264depay') and _has('h264parse') else 'no'),
                       'audio OPUS',
                       'echo cancellation %s' % ('webrtcdsp' if _has('webrtcdsp') and _has('webrtcechoprobe') else 'none')])
+
+
+class AudioDevice(object):
+    """A microphone or speakers the system has: name, whether it is the system default, and the element using it."""
+
+    def __init__(self, device):
+        self.device = device
+        self.name = device.get_display_name()
+        self.default = False
+        properties = device.get_properties()
+        if properties is not None and properties.has_field('is-default'):
+            try:
+                self.default = bool(properties.get_value('is-default'))
+            except (TypeError, ValueError):
+                pass
+
+    def element(self, name):
+        element = self.device.create_element(name)
+        if element is None:
+            raise RuntimeError(f'cannot use {self.name}')
+        return element
+
+    def __str__(self):
+        return self.name
+
+
+def audio_devices():
+    """([inputs], [outputs]): the AudioDevices the system has now."""
+    if not _init():
+        return [], []
+    monitor = Gst.DeviceMonitor.new()
+    monitor.add_filter('Audio/Source', None)
+    monitor.add_filter('Audio/Sink', None)
+    started = monitor.start()
+    try:
+        devices = monitor.get_devices() or []
+    finally:
+        if started:
+            monitor.stop()
+    found = {'Audio/Source': [], 'Audio/Sink': []}
+    for device in devices:
+        for kind, chosen in found.items():
+            if device.has_classes(kind) and device.get_display_name() not in [each.name for each in chosen]:
+                chosen.append(AudioDevice(device))
+    for chosen in found.values():
+        chosen.sort(key=lambda each: (not each.default, each.name.lower()))
+    return found['Audio/Source'], found['Audio/Sink']
+
+
+def _replace_audio(media, kind, description):
+    """Use other speakers (kind output) or another microphone (input) in media's pipeline, running or not:
+    description is auto, none, a GStreamer description or an AudioDevice."""
+    sink = kind == 'output'
+    setattr(media, 'audio_output' if sink else 'audio_input', description)
+    pipeline = media.pipeline
+    if pipeline is None:
+        return
+    name = 'speakers' if sink else 'microphone'
+    old = pipeline.get_by_name(name)
+    if old is None:
+        raise RuntimeError(f'no {name} in the pipeline')
+    new = RoomMedia._audio_element(media, description, name, sink)
+    if sink:
+        if new.find_property('async') is not None:
+            new.set_property('async', False)        # no preroll to wait for in a playing pipeline
+        old_pad = old.get_static_pad('sink')
+        upstream = old_pad.get_peer()
+        if upstream is None:
+            raise RuntimeError(f'the {name} are not linked')
+
+        def idle(pad, info):
+            # the thread that pushes to the speakers, between buffers (or right now)
+            pad.unlink(old_pad)
+            old.set_state(Gst.State.NULL)
+            pipeline.remove(old)
+            pipeline.add(new)
+            pad.link(new.get_static_pad('sink'))
+            new.sync_state_with_parent()
+            return Gst.PadProbeReturn.REMOVE
+        upstream.add_probe(Gst.PadProbeType.IDLE, idle)
+    else:
+        old_pad = old.get_static_pad('src')
+        downstream = old_pad.get_peer()
+        old.set_state(Gst.State.NULL)       # a source: its own thread stops, nothing downstream is flushed
+        if downstream is not None:
+            old_pad.unlink(downstream)
+        pipeline.remove(old)
+        pipeline.add(new)
+        if downstream is not None:
+            new.get_static_pad('src').link(downstream)
+        new.sync_state_with_parent()
 
 
 def parse_resolution(text):
@@ -146,6 +239,45 @@ def _make(factory, name=None, **properties):
     return element
 
 
+def _level(name):
+    """A level element measuring the audio going through it every LEVEL_INTERVAL ([] without the level plugin)."""
+    return [_make('level', name, interval=LEVEL_INTERVAL, post_messages=True)] if _has('level') else []
+
+
+class _Levels(object):
+    """The audio levels the level elements post (any thread): RMS averaged (in power) and peak maxed until taken."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._levels = {}       # element name -> [power sum, count, peak max]
+
+    def add(self, structure, name):
+        """A bus message's structure: the peak (dBFS) when it is a level one, else None."""
+        if structure is None or structure.get_name() != 'level':
+            return None
+        try:
+            rms = max(structure.get_value('rms') or [-100.0])
+            peak = max(structure.get_value('peak') or [-100.0])
+        except (TypeError, ValueError):
+            return None
+        rms, peak = max(-100.0, rms), max(-100.0, peak)
+        with self._lock:
+            entry = self._levels.setdefault(name, [0.0, 0, -100.0])
+            entry[0] += 10 ** (rms / 10)
+            entry[1] += 1
+            entry[2] = max(entry[2], peak)
+        return peak
+
+    def take(self, name):
+        """(RMS dBFS, peak dBFS) since the last take, None when nothing was measured."""
+        with self._lock:
+            entry = self._levels.pop(name, None)
+        if not entry or not entry[1]:
+            return None
+        power = entry[0] / entry[1]
+        return (10 * math.log10(power) if power > 1e-10 else -100.0, entry[2])
+
+
 def _link_chain(pipeline, elements, add=True):
     if add:
         for element in elements:
@@ -164,6 +296,36 @@ def _sdp_message(text):
 
 def _description(kind, text):
     return GstWebRTC.WebRTCSessionDescription.new(kind, _sdp_message(text))
+
+
+def _watch_states(webrtcbin, label):
+    """Log how the ICE and DTLS connection of a webrtcbin gets on (each change, info; gathering, debug)."""
+    def changed(element, spec, what, level):
+        value = element.get_property(spec.name)
+        log.log(level, f'{label}: {what} {getattr(value, "value_nick", value)}')
+    webrtcbin.connect('notify::ice-gathering-state', changed, 'ICE gathering', logging.DEBUG)
+    webrtcbin.connect('notify::ice-connection-state', changed, 'ICE', logging.INFO)
+    webrtcbin.connect('notify::connection-state', changed, 'connection (ICE+DTLS)', logging.INFO)
+
+
+def _checked(label, what):
+    """A promise that logs an error webrtcbin replies with (set-remote-description and the like do not raise)."""
+    def done(promise, data):
+        promise.wait()
+        reply = promise.get_reply()
+        if reply is not None and reply.has_field('error'):
+            error = reply.get_value('error')
+            log.error(f'{label}: {what} failed: {getattr(error, "message", error)}')
+    return Gst.Promise.new_with_change_func(done, None)
+
+
+def connection_state(webrtcbin):
+    """'ICE x, connection y' of a webrtcbin, or ''."""
+    if webrtcbin is None:
+        return ''
+    ice = webrtcbin.get_property('ice-connection-state')
+    connection = webrtcbin.get_property('connection-state')
+    return f'ICE {getattr(ice, "value_nick", ice)}, connection {getattr(connection, "value_nick", connection)}'
 
 
 def _configure_ice(webrtcbin, ice_servers):
@@ -288,6 +450,7 @@ class RoomMedia(object):
         self._volume = None
         self._video_pad = None
         self._video_ssrc = random.randint(1, 0xffffffff)
+        self._levels = _Levels()
 
     # The publisher
 
@@ -298,6 +461,7 @@ class RoomMedia(object):
         if self.session.video and (self.video_source or {}).get('kind') not in ('v4l2', 'test'):
             raise RuntimeError('our own video must be a local camera (v4l2 or test)')
         self.pipeline = Gst.Pipeline.new('videoroom')
+        self.pipeline.use_clock(Gst.SystemClock.obtain())     # the microphone or speakers may change while playing
         self.pipeline.get_bus().set_sync_handler(self._on_bus_message, None)
         echo_cancellation = self.audio_input != 'none' and self.audio_output != 'none' and _has('webrtcdsp') and _has('webrtcechoprobe')
 
@@ -318,7 +482,7 @@ class RoomMedia(object):
         if echo_cancellation:
             microphone += [_make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,rate=48000,channels=1')), _make('webrtcdsp', 'dsp', probe='echoprobe')]
         self._volume = _make('volume', 'micvolume', mute=self.session.audio_muted)
-        microphone += [self._volume, _make('audioconvert'), _make('audioresample'),
+        microphone += [self._volume] + _level('miclevel') + [_make('audioconvert'), _make('audioresample'),
                        _make('queue', max_size_time=200 * Gst.MSECOND, leaky='downstream'),
                        _make('opusenc', bitrate=32000, inband_fec=True, audio_type='voice'),
                        _make('rtpopuspay', pt=OPUS_PT)]
@@ -354,6 +518,8 @@ class RoomMedia(object):
             return _make('audiotestsrc', name, wave='silence', is_live=True)
         if description in (None, '', 'auto'):
             return _make('autoaudiosink' if sink else 'autoaudiosrc', name)
+        if isinstance(description, AudioDevice):
+            return description.element(name)
         element = Gst.parse_bin_from_description(description, True)
         element.set_name(name)
         return element
@@ -376,7 +542,7 @@ class RoomMedia(object):
                 log.warning(f'{self.session.room}: the room takes no video from us')
             else:
                 self._link_camera(*codec)
-        self.publisher.emit('set-remote-description', _description(GstWebRTC.WebRTCSDPType.ANSWER, sdp), Gst.Promise.new())
+        self.publisher.emit('set-remote-description', _description(GstWebRTC.WebRTCSDPType.ANSWER, sdp), _checked(self.session.room, 'using the answer'))
 
     def _link_camera(self, name, pt):
         _link_camera(self.pipeline, self._video_pad, self.video_source, name, pt, self._video_ssrc, self.MAIN_FPS, self.session.room)
@@ -384,6 +550,11 @@ class RoomMedia(object):
     def set_audio_muted(self, muted):
         if self._volume is not None:
             self._volume.set_property('mute', bool(muted))
+
+    def set_audio_device(self, kind, description):
+        """Other speakers (kind output) or another microphone (input): auto, none, a GStreamer description or an
+        AudioDevice; replaced in the running pipeline."""
+        _replace_audio(self, kind, description)
 
     def stop(self):
         if self.pipeline is not None:
@@ -396,6 +567,7 @@ class RoomMedia(object):
 
     def _watch_webrtcbin(self, webrtcbin, label):
         session = self.session
+        _watch_states(webrtcbin, f'{self.session.room} {label}')
         webrtcbin.connect('on-negotiation-needed', lambda element: None)
         webrtcbin.connect('on-ice-candidate', lambda element, mline, candidate: session.candidate(label, mline, _mid(element, mline), candidate))
         webrtcbin.connect('notify::ice-gathering-state', lambda element, spec: element.get_property('ice-gathering-state') == GstWebRTC.WebRTCICEGatheringState.COMPLETE and session.end_of_candidates(label))
@@ -412,15 +584,11 @@ class RoomMedia(object):
         elif message.type == Gst.MessageType.WARNING:
             warning, debug = message.parse_warning()
             log.debug(f'{self.session.room}: GStreamer warning in {message.src.get_name() if message.src else "?"}: {warning.message}')
-        elif message.type == Gst.MessageType.ELEMENT and message.src is not None and message.src.get_name().startswith('level-'):
-            structure = message.get_structure()
-            if structure is not None and structure.get_name() == 'level':
-                try:
-                    peaks = structure.get_value('peak')
-                    peak = max(peaks) if peaks else -100.0
-                except (TypeError, ValueError):
-                    peak = -100.0
-                self.session.level(message.src.get_name()[6:], peak > SPEAKING_DB)
+        elif message.type == Gst.MessageType.ELEMENT and message.src is not None:
+            name = message.src.get_name()
+            peak = self._levels.add(message.get_structure(), name)
+            if peak is not None and name.startswith('level-'):
+                self.session.level(name[6:], peak > SPEAKING_DB)
         return Gst.BusSyncReply.DROP
 
     # Feeds
@@ -532,6 +700,20 @@ class RoomMedia(object):
         for participant in list(self.session.feeds.values()):
             if participant.media and participant.media.get('webrtcbin') is not None:
                 found.append((participant.name, 'in', webrtcbin_stats(participant.media['webrtcbin'])))
+        return found
+
+    def levels(self):
+        """{(label, direction): (RMS dBFS, peak dBFS)} since the last call, labelled as in stats(): what our microphone
+        sends, what every feed plays."""
+        found = {}
+        mic = self._levels.take('miclevel')
+        if mic is not None:
+            found[('audio+video' if self._video_pad is not None else 'audio', 'out')] = mic
+        for participant in list(self.session.feeds.values()):
+            if participant.media:
+                level = self._levels.take('level-' + participant.feed)
+                if level is not None:
+                    found[(participant.name, 'in')] = level
         return found
 
     # Extra videos
@@ -728,7 +910,7 @@ class ExtraMedia(object):
                 self._tee.link(head[0])
                 encode[-1].get_static_pad('src').link(self._video_pad)
                 self.log(f'encoding the camera to {name} {self.width}x{self.height} {self.fps} fps, {self.bitrate} kbit/s ({encoder_factory})')
-                self.webrtcbin.emit('set-remote-description', _description(GstWebRTC.WebRTCSDPType.ANSWER, sdp), Gst.Promise.new())
+                self.webrtcbin.emit('set-remote-description', _description(GstWebRTC.WebRTCSDPType.ANSWER, sdp), _checked(self.extra.label, 'using the answer'))
                 return
             chain = encode
             self.log(f'sending {name} {self.width}x{self.height} {self.fps} fps, {self.bitrate} kbit/s ({encoder_factory})')
@@ -738,7 +920,7 @@ class ExtraMedia(object):
         for element in chain:
             element.sync_state_with_parent()
         self._tee.link(chain[0])
-        self.webrtcbin.emit('set-remote-description', _description(GstWebRTC.WebRTCSDPType.ANSWER, sdp), Gst.Promise.new())
+        self.webrtcbin.emit('set-remote-description', _description(GstWebRTC.WebRTCSDPType.ANSWER, sdp), _checked(self.extra.label, 'using the answer'))
 
     def stop(self):
         pipeline, self.pipeline = self.pipeline, None
@@ -806,6 +988,7 @@ class CallMedia(object):
         self._volume = None
         self._video_pad = None
         self._video_ssrc = random.randint(1, 0xffffffff)
+        self._levels = _Levels()
         self._remote_size = None
         self._camera_linked = False
 
@@ -821,6 +1004,7 @@ class CallMedia(object):
         if self.video_source is not None and self.video_source.get('kind') not in ('v4l2', 'test'):
             raise RuntimeError('the camera of a call must be a local one (v4l2 or test)')
         self.pipeline = Gst.Pipeline.new('call')
+        self.pipeline.use_clock(Gst.SystemClock.obtain())     # the microphone or speakers may change while playing
         self.pipeline.get_bus().set_sync_handler(self._on_bus_message, None)
         echo_cancellation = self.audio_input != 'none' and self.audio_output != 'none' and _has('webrtcdsp') and _has('webrtcechoprobe')
 
@@ -842,6 +1026,7 @@ class CallMedia(object):
         webrtcbin.connect('notify::ice-gathering-state', lambda element, spec: element.get_property('ice-gathering-state') == GstWebRTC.WebRTCICEGatheringState.COMPLETE and call.end_of_candidates())
         webrtcbin.connect('notify::ice-connection-state', lambda element, spec: element.get_property('ice-connection-state') == GstWebRTC.WebRTCICEConnectionState.FAILED and call.ice_failed())
         webrtcbin.connect('pad-added', self._on_pad)
+        _watch_states(webrtcbin, call.peer)
 
         # what the far end offered decides the payload types of an answer
         audio_codecs = offered_codecs(offer, 'audio') if offer else []
@@ -854,7 +1039,7 @@ class CallMedia(object):
             microphone += [_make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,rate=48000,channels=1')), _make('webrtcdsp', 'dsp', probe='echoprobe')]
         self._volume = _make('volume', 'micvolume', mute=self.call.audio_muted)
         audio_caps = Gst.Caps.from_string(f'application/x-rtp,media=audio,encoding-name=OPUS,payload={opus_pt},clock-rate=48000,encoding-params=(string)2')
-        microphone += [self._volume, _make('audioconvert'), _make('audioresample'),
+        microphone += [self._volume] + _level('miclevel') + [_make('audioconvert'), _make('audioresample'),
                        _make('queue', max_size_time=200 * Gst.MSECOND, leaky='downstream'),
                        _make('opusenc', bitrate=32000, inband_fec=True, audio_type='voice'),
                        _make('rtpopuspay', pt=opus_pt), _make('capsfilter', caps=audio_caps)]
@@ -930,9 +1115,15 @@ class CallMedia(object):
 
     def set_answer(self, sdp):
         """The far end's answer to our offer."""
+        offer = self.webrtcbin.get_property('local-description')
+        if offer is not None:
+            completed = complete_answer(offer.sdp.as_text(), sdp)
+            if completed != sdp:
+                log.info(f'{self.call.peer}: the answer leaves out media of our offer: taken as rejected')
+                sdp = completed
         if self._video_pad is not None:
             self._link_our_video(sdp)
-        self.webrtcbin.emit('set-remote-description', _description(GstWebRTC.WebRTCSDPType.ANSWER, sdp), Gst.Promise.new())
+        self.webrtcbin.emit('set-remote-description', _description(GstWebRTC.WebRTCSDPType.ANSWER, sdp), _checked(self.call.peer, 'using the answer'))
 
     def _link_our_video(self, sdp):
         if self._camera_linked:
@@ -1051,6 +1242,7 @@ class CallMedia(object):
         if kind.startswith('audio/'):
             chain = [_make('queue', max_size_buffers=0, max_size_bytes=0, max_size_time=RECEIVED_AUDIO_QUEUE * Gst.SECOND, leaky='downstream'), _make('audioconvert'), _make('audioresample'),
                      _make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,rate=48000,channels=2'))]
+            chain += _level('level-remote')
             playback = self._playback.get_static_pad('sink')
             if playback.is_linked():
                 self._discard(pad)      # a second audio stream: not expected in a call
@@ -1116,6 +1308,11 @@ class CallMedia(object):
         if self._volume is not None:
             self._volume.set_property('mute', bool(muted))
 
+    def set_audio_device(self, kind, description):
+        """Other speakers (kind output) or another microphone (input): auto, none, a GStreamer description or an
+        AudioDevice; replaced in the running pipeline."""
+        _replace_audio(self, kind, description)
+
     def stop(self):
         if self.pipeline is not None:
             pipeline, self.pipeline = self.pipeline, None
@@ -1128,10 +1325,20 @@ class CallMedia(object):
         if self.webrtcbin is None:
             return []
         stats = webrtcbin_stats(self.webrtcbin)
-        out = dict(stats, received_bytes=0, received_packets=0, lost_received=0)
-        incoming = dict(stats, sent_bytes=0, sent_packets=0, lost_sent=None, fraction_lost_sent=None, rtt=None)
+        out = dict(stats, received_bytes=0, received_packets=0, lost_received=0, jitter_received=None)
+        incoming = dict(stats, sent_bytes=0, sent_packets=0, lost_sent=None, fraction_lost_sent=None, rtt=None, jitter_sent=None)
         return [('audio+video' if self._camera_linked else 'audio', 'out', out),
                 ('audio+video' if self._remote_size else 'audio', 'in', incoming)]
+
+    def levels(self):
+        """{(label, direction): (RMS dBFS, peak dBFS)} since the last call, labelled as in stats()."""
+        found = {}
+        for name, key in (('miclevel', ('audio+video' if self._camera_linked else 'audio', 'out')),
+                          ('level-remote', ('audio+video' if self._remote_size else 'audio', 'in'))):
+            level = self._levels.take(name)
+            if level is not None:
+                found[key] = level
+        return found
 
     def _on_bus_message(self, bus, message, data):
         # any thread
@@ -1147,6 +1354,8 @@ class CallMedia(object):
         elif message.type == Gst.MessageType.WARNING:
             warning, debug = message.parse_warning()
             log.debug(f'call: GStreamer warning in {message.src.get_name() if message.src else "?"}: {warning.message}')
+        elif message.type == Gst.MessageType.ELEMENT and message.src is not None:
+            self._levels.add(message.get_structure(), message.src.get_name())
         return Gst.BusSyncReply.DROP
 
 
@@ -1154,10 +1363,10 @@ class CallMedia(object):
 
 def webrtcbin_stats(webrtcbin):
     """What a webrtcbin sent and received so far: dict(sent_bytes, sent_packets, received_bytes, received_packets,
-    lost_received, lost_sent (cumulative, None when not reported), fraction_lost_sent (last report), rtt (seconds, None
-    when unknown)). Blocks for the answer (it is quick)."""
+    lost_received, lost_sent (cumulative, None when not reported), fraction_lost_sent (last report), rtt, jitter_received
+    (ours), jitter_sent (the far end's report) (seconds, None when unknown)). Blocks for the answer (it is quick)."""
     totals = dict(sent_bytes=0, sent_packets=0, received_bytes=0, received_packets=0, lost_received=0, lost_sent=None,
-                  fraction_lost_sent=None, rtt=None)
+                  fraction_lost_sent=None, rtt=None, jitter_received=None, jitter_sent=None)
     if webrtcbin is None:
         return totals
     promise = Gst.Promise.new()
@@ -1187,6 +1396,9 @@ def webrtcbin_stats(webrtcbin):
             totals['received_bytes'] += number(value, 'bytes-received') or 0
             totals['received_packets'] += number(value, 'packets-received') or 0
             totals['lost_received'] += max(0, number(value, 'packets-lost') or 0)
+            jitter = number(value, 'jitter')
+            if jitter is not None and jitter >= 0:
+                totals['jitter_received'] = max(jitter, totals['jitter_received'] or 0)
         elif kind == 'remote-inbound-rtp':      # the far end's receiver reports about what we send
             lost = number(value, 'packets-lost')
             if lost is not None and lost >= 0:
@@ -1197,6 +1409,9 @@ def webrtcbin_stats(webrtcbin):
             rtt = number(value, 'round-trip-time')
             if rtt is not None and rtt > 0:
                 totals['rtt'] = max(rtt, totals['rtt'] or 0)
+            jitter = number(value, 'jitter')
+            if jitter is not None and jitter >= 0:
+                totals['jitter_sent'] = max(jitter, totals['jitter_sent'] or 0)
         return True
 
     reply.foreach(field)

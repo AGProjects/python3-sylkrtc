@@ -40,7 +40,7 @@ from zope.interface import implementer
 
 from sylkrtc import sipconfig
 from sylkrtc.call import Account
-from sylkrtc.cli import Console, Statistics, addresses, report_discovery, report_server_info, select_cameras, setup_logging, start_log_file
+from sylkrtc.cli import AudioChoice, Console, Statistics, addresses, report_discovery, report_server_info, select_cameras, setup_logging, start_log_file
 from sylkrtc.discovery import Discovery
 from sylkrtc.rooms import RoomTarget
 from sylkrtc.videoroom import Identity
@@ -50,10 +50,12 @@ log = logging.getLogger('sylk-session')
 
 from sylkrtc.device import USER_AGENT     # one device for all the tools (sylkrtc.device)
 
-KEYS_SHORT = {'call': 'm mute, s statistics, i info, x hang up, 0-9*# DTMF, Enter message, / command, h or ? help'}
+KEYS_SHORT = {'call': 'm mute, s statistics, r live RTP, a/o next microphone/speakers, d devices, i info, x hang up, 0-9*# DTMF, Enter message, / command, h or ? help'}
 KEYS_HELP = {
     'idle': '''* keys (no Enter):
     c      call someone (type user or user@domain)
+    d      the audio devices (* the one used)
+    a o    the next microphone, the next speakers
     /      type a command (/call, /quit, ...)
     q      quit
     h ?    this''',
@@ -69,6 +71,9 @@ KEYS_HELP = {
     'call': '''* in a call, one key each:
     m      mute / unmute the microphone
     s      RTP statistics now: per stream rate, bytes, round trip time, loss; then the totals
+    r      log RTP statistics and audio levels every 2 s, or stop
+    d      the audio devices (* the one used)
+    a o    the next microphone, the next speakers (a configured one and the system default count too)
     i      who, how long, muted, video codec
     x      hang up
     0-9*#  DTMF (SIP INFO)
@@ -242,6 +247,8 @@ class SylkCall(object):
             log.error('missing: ' + ', '.join(f'{what} (install {package})' for what, package in missing))
             reactor.stop()
             return
+        self.audio = AudioChoice(self.audio_input, self.audio_output)
+        print('\n'.join(f'* {line}' for line in self.audio.lines()))
         log.info(f'account {self.account_info.id} (from {os.path.join(self.config_dir, "config")})'
                  + (f', our video {self.camera[0]}' if self.camera else ', no video of ours')
                  + f', their video: {self.video_output}')
@@ -273,7 +280,7 @@ class SylkCall(object):
             output = None
         elif output == 'window':
             self.window = output = RemoteVideo(f'{call.peer} - sylk-session')
-        return CallMedia(call, audio_input=self.audio_input, audio_output=self.audio_output,
+        return CallMedia(call, audio_input=self.audio.chosen['input'], audio_output=self.audio.chosen['output'],
                          video_source=self.camera[1] if self.camera else None, video_output=output, ice_servers=self.server.ice_servers,
                          video_size=self.video_size)
 
@@ -519,6 +526,14 @@ class SylkCall(object):
                 self.waiting_call = None
                 waiting.reject()
             return False
+        if key in 'dao' and key and hasattr(self, 'audio'):
+            if key == 'd':
+                print('\n'.join(f'* {line}' for line in self.audio.lines()))
+            else:
+                kind = 'input' if key == 'a' else 'output'
+                self.audio.select(kind)
+                print('* ' + self.audio.apply(call.media if call is not None and call.state not in ('idle', 'terminated') else None, kind))
+            return False
         if key == '/':
             self.line_purpose = 'command'
             print('/', end='', flush=True)
@@ -557,6 +572,8 @@ class SylkCall(object):
             elif key == 's':
                 lines = self.statistics.lines()
                 print('\n'.join(f'* {line}' for line in lines) if lines else '* no statistics yet')
+            elif key == 'r':
+                print(f'* RTP statistics and audio levels every {self.statistics.LIVE_INTERVAL} s' if self.statistics.toggle_live() else '* RTP statistics off')
             elif key == 'i':
                 seconds = int(reactor.seconds() - (getattr(self, 'established_at', None) or reactor.seconds()))
                 codec = getattr(call.media, 'video_codec', None) if call.media is not None else None

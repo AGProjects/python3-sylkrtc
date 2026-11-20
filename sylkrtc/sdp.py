@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 
 __all__ = ['media_summary', 'offers_video', 'video_ssrc', 'chosen_video_codec', 'cvo_id', 'with_cvo', 'rtp_extension',
-           'mids', 'ice_urls', 'offered_codecs', 'has_media', 'for_sip', 'CVO_URI']
+           'mids', 'ice_urls', 'offered_codecs', 'has_media', 'for_sip', 'complete_answer', 'CVO_URI']
 
 
 CVO_URI = 'urn:3gpp:video-orientation'
@@ -25,6 +25,55 @@ def _sections(sdp):
 
 def _rejected(port, section):
     return port == '0' and 'a=bundle-only' not in section
+
+
+def _split(sdp):
+    """(session part, [m-line sections, each from its m= line])."""
+    starts = [match.start() for match in re.finditer(r'^m=', sdp, re.M)]
+    if not starts:
+        return sdp, []
+    return sdp[:starts[0]], [sdp[start:end] for start, end in zip(starts, starts[1:] + [len(sdp)])]
+
+
+def _mid(section):
+    match = re.search(r'^a=mid:([^\r\n]+)', section, re.M)
+    return match.group(1).strip() if match else None
+
+
+def complete_answer(offer, answer):
+    """The answer with an m-line for every one of the offer, in its order: one the answer left out (it must not,
+    RFC 3264 6, but some gateways do for a media they do not take) added as rejected (port 0). Matched by a=mid;
+    the answer as it is when it already matches or has no mids."""
+    offer_head, offered = _split(offer)
+    head, sections = _split(answer)
+    by_mid = {_mid(section): section for section in sections}
+    if None in by_mid or len(sections) == len(offered) and [_mid(section) for section in sections] == [_mid(section) for section in offered]:
+        return answer
+    newline = '\r\n' if '\r\n' in answer else '\n'
+    # webrtcbin wants ICE credentials (and DTLS ones) on every m-line, a rejected one too: those of the answer's
+    shared = []
+    for attribute in ('ice-ufrag', 'ice-pwd', 'setup', 'fingerprint'):
+        if re.search(r'^a=%s:' % attribute, head, re.M):
+            continue
+        for section in sections:
+            match = re.search(r'^a=%s:[^\r\n]+' % attribute, section, re.M)
+            if match:
+                shared.append(match.group(0))
+                break
+    completed = []
+    for section in offered:
+        mid = _mid(section)
+        if mid in by_mid:
+            completed.append(by_mid[mid])
+            continue
+        media, proto, payloads = re.match(r'm=(\w+) \d+ ([^ \r\n]+) ?([^\r\n]*)', section).groups()
+        lines = [f'm={media} 0 {proto} {(payloads.split() or ["0"])[0]}', 'c=IN IP4 0.0.0.0', 'a=inactive'] + shared
+        if mid is not None:
+            lines.append(f'a=mid:{mid}')
+        completed.append(newline.join(lines) + newline)
+    if not head.endswith(newline):
+        head += newline
+    return head + ''.join(section if section.endswith(newline) else section + newline for section in completed)
 
 
 def media_summary(sdp):
