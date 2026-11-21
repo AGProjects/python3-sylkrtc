@@ -294,8 +294,10 @@ ringing in: y accept, n reject; one ringing in during a call asks the same, y
 hanging up the current call first. Calling: x hang up. In a call: m mute/unmute,
 s RTP statistics (per stream rate, bytes, round trip time, loss, then the
 totals), r RTP statistics and audio levels (RMS and peak dBFS) logged every 2 s,
-again to stop, d the audio devices, a the next microphone, o the next speakers
-(also when not in a call, for the next one), i call info, x hang up, 0-9 * # DTMF (SIP INFO), Enter to type a message
+again to stop, d the audio devices, v the next microphone, o the next speakers, a hear the
+selected mixer strip of ours in the headphones too (--monitor or --playback)
+(also when not in a call, for the next one), i call info, x, e, q or h hang up, ? the keys, 0-9 the level of the mixer strip selected (← →; 0 off, 1 to 9: -40 dB,
+barely heard, to 0 dB, 5 dB a step), k the DTMF keypad (SIP INFO: 0-9 * # then send DTMF), Enter to type a message
 to the far end. The commands typed after /: /answer, /reject, /hangup,
 /call user[@domain], /mute, /unmute, /dtmf DIGITS, /stats, /quit. A call
 placed from the command line exits when it ends; waiting for calls goes on after

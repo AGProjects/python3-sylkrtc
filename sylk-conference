@@ -49,8 +49,9 @@ from twisted.internet.task import deferLater
 from zope.interface import implementer
 
 from sylkrtc import sipconfig
-from sylkrtc.cli import (AudioChoice, Console, Statistics, addresses, report_discovery, report_server_info, select_cameras,
-                         setup_logging, start_log_file, take_room_from_cameras)
+from sylkrtc.cli import (network_lines, network_text, with_sidebar, BOLD, DIM, GAP, RED, RESET, SCALE, AudioChoice, Console, MixerControl, Statistics, StatusPanel, addresses,
+                         human_bytes, human_rate, meter_panel, report_discovery, report_server_info, select_cameras,
+                         setup_logging, start_log_file, take_room_from_cameras, vu_meters)
 from sylkrtc.discovery import Discovery
 from sylkrtc.rooms import RoomTarget, parse_room, configuration_domain
 from sylkrtc.videoroom import Identity, VideoroomSession, MAX_EXTRA_VIDEOS
@@ -95,6 +96,23 @@ def parse_arguments():
     parser.add_argument('--record-audio', nargs='?', const=RECORDINGS, default=None, metavar='FOLDER',
                         help=f'record what the room plays (everyone else, mixed) as Ogg Opus into FOLDER/<room\'s SIP URI>/<time>.ogg '
                              f'(default folder: {RECORDINGS})')
+    parser.add_argument('--device-level', type=int, choices=range(10), default=None, metavar='0-9',
+                        help='our audio input device\'s (microphone\'s) level at first, as the keys set it: 0 muted, 1 to 9 '
+                             'from -40 dB (barely heard) to 0 dB, 5 dB a step (default 0 dB, 9)')
+    parser.add_argument('--playback-random', action='store_true',
+                        help='start the music at a random file of those given (a folder: any of its files), then on in order; '
+                             'each time we connect')
+    parser.add_argument('--playback-level', type=int, choices=range(10), default=None, metavar='0-9',
+                        help='the music\'s level at first, as the keys set it: 0 muted, 1 to 9 from -40 dB (barely heard) to 0 dB, 5 dB a step (default -6 dB)')
+    parser.add_argument('--total-out-level', action='store_true', help='with --playback: the total of what we send in the mixer too '
+                                                                       '(its level and a volume for all of it)')
+    parser.add_argument('--monitor', action='store_true', help='hear what we send in our headphones too, from the start: each of ours (the microphone, '
+                                                               'the music) on or off with a or space when selected in the mixer (with --playback alone: off at first)')
+    parser.add_argument('--playback', action='append', default=[], metavar='PATH',
+                        help='mix music into what we send (repeatable): audio files, or folders of them, played in order and again; '
+                             'with it the terminal takes single keys and the panel is a mixer: left and right arrows select the '
+                             'microphone or the music, up and down set its gain; Enter (or t) types a chat message, / a command '
+                             '(in stereo with --stereo)')
     parser.add_argument('--stereo', action='store_true', help='stereo audio: a stereo microphone (or the source of --audio-input) and Opus in stereo, no echo canceller; a room made by joining it becomes a stereo room (one that exists keeps its own audio: mono participants hear and send mono)')
     parser.add_argument('--discover', action='store_true', help='only look up the SylkServer configuration of the account\'s domain (and of the room\'s, when given), cache it and show it')
     parser.add_argument('--server-info', action='store_true', help='connect to the SylkServer of the account (or of the room, when given) and report its version, '
@@ -105,13 +123,24 @@ def parse_arguments():
                         help='leave the room and exit this many seconds after first getting in (default 600, 10 minutes; '
                              'with --record-audio 0; 0: stay)')
     parser.add_argument('--no-retry', action='store_true', help='exit when the room is left instead of joining again')
+    parser.add_argument('--auto-reconnect', action='store_true',
+                        help=f'stay: join the room again {RETRY_DELAYS[0]:g} s after the connection to it breaks, every time (no longer '
+                             'waits between attempts), and do not leave by itself (--auto-disconnect 0 unless given)')
+    parser.add_argument('-j', '--jitter', action='store_true', help='show the jitter in the status panel too')
+    parser.add_argument('--jitter-buffer', type=int, default=None, metavar='MS',
+                        help='how long the jitter buffer waits for packets (default 200 ms): more for a network that delivers in bursts '
+                             '(gaps heard, late packets in the panel, but no loss), at the cost of as much delay')
+    parser.add_argument('--no-panel', action='store_true', help='no status panel at the top of the terminal (a level meter per '
+                                                                'participant, loss, round trip time), only the scrolling console')
     parser.add_argument('--no-input', action='store_true', help='do not read chat messages and commands from the terminal')
     parser.add_argument('-v', '--verbose', '--debug', dest='debug', action='store_true', help='log debug messages')
     parser.add_argument('--sdp', action='store_true', help='log the SDP offers and answers exchanged')
     parser.add_argument('-t', '--trace', action='store_true', help='log the sylkRTC messages')
     arguments = parser.parse_args()
-    if arguments.auto_disconnect is None:       # a recording runs until it is stopped (Ctrl-C, /quit)
-        arguments.auto_disconnect = 0 if arguments.record_audio or arguments.record_tracks else 600
+    if arguments.auto_reconnect and arguments.no_retry:
+        raise SystemExit('--auto-reconnect and --no-retry: one or the other')
+    if arguments.auto_disconnect is None:       # a recording (or --auto-reconnect) runs until it is stopped (Ctrl-C, /quit)
+        arguments.auto_disconnect = 0 if arguments.record_audio or arguments.record_tracks or arguments.auto_reconnect else 600
     return arguments
 
 
@@ -196,7 +225,11 @@ class SylkConference(object):
         self.attempt = 0
         self.stopping = False
         self.statistics = Statistics(arguments.stats_interval)
+        self.mixer_control = MixerControl(hidden=() if arguments.total_out_level else [('send', 'total')])      # the console mixer
+        self.console = None
         self.audio = AudioChoice(self.audio_input, self.audio_output)
+        self.audio.on_switch = self._audio_switched
+        self.audio.watch()          # the devices that come and go, as the system tells
         NotificationCenter().add_observer(self)
 
     # Start
@@ -283,7 +316,11 @@ class SylkConference(object):
             print(f'* recording each participant into {tracks}/')
         self.session = VideoroomSession(self.identity, self.target.video_uri, self.target.ws_server,
                                         MediaFactory(audio_input=self.audio.chosen['input'], audio_output=self._audio_output(), stereo=self.stereo,
-                                                     record_tracks=tracks, track_paths=self.track_paths,
+                                                     record_tracks=tracks, track_paths=self.track_paths, playback=self.arguments.playback or None,
+                                                     monitor=self.arguments.monitor,
+                                                     playback_gain=None if self.arguments.playback_level is None else MixerControl.level_gain(self.arguments.playback_level),
+                                                     mic_gain=0.0 if self.arguments.device_level is None else MixerControl.level_gain(self.arguments.device_level),
+                                                     jitter_buffer=self.arguments.jitter_buffer, playback_random=self.arguments.playback_random,
                                                      video_source=self.main_camera[1] if self.main_camera else None),
                                         ice_servers=self.target.ice_servers, guest_domain=self.target.guest_domain if self.remote else None,
                                         audio=not self.muted, video=self.main_camera is not None, receive_video=False, user_agent=USER_AGENT,
@@ -371,6 +408,7 @@ class SylkConference(object):
         if state == 'established':
             self.attempt = 0
             self._established = True
+            self.established_at = reactor.seconds()
             self.statistics.start(self.session)
             log.info(f'in the room {self.session.room}' + (f' as {self.session.address}' if self.session.guest else '') +
                      (' (microphone muted)' if self.session.audio_muted else '') +
@@ -397,9 +435,9 @@ class SylkConference(object):
                 if not self.stopping and reactor.running:
                     reactor.stop()
                 return
-            delay = RETRY_DELAYS[min(self.attempt, len(RETRY_DELAYS) - 1)]
+            delay = RETRY_DELAYS[0 if self.arguments.auto_reconnect else min(self.attempt, len(RETRY_DELAYS) - 1)]
             self.attempt += 1
-            log.info(f'joining again in {delay} s')
+            log.info(f'joining again in {delay} s' + (' (--auto-reconnect)' if self.arguments.auto_reconnect else ''))
             reactor.callLater(delay, self.join)
 
     def _NH_VideoroomExtraVideoDidChangeState(self, notification):
@@ -460,9 +498,224 @@ class SylkConference(object):
         if notification.sender is self.session and not notification.data.delivered:
             print(f'* message not delivered: {notification.data.code} {notification.data.reason}')
 
+    def _audio_switched(self, kind):
+        """A device plugged in (or the one used gone): used now, but not the speakers while recording."""
+        if kind == 'output' and self.arguments.record_audio:
+            self.audio.chosen['output'] = self.audio.configured['output']
+            print('* new speakers not used: they cannot change while recording (--record-audio)')
+            return
+        media = self.session.media if self.session is not None and self.session.state not in ('idle', 'terminated') else None
+        print('* ' + self.audio.apply(media, kind))
+
+    # The status panel: the top 65% of the terminal, the console scrolling under it
+
+    PANEL_FRACTION = 0.65
+    SIDEBAR_WIDTH = 44       # the list of the audio devices, on the left of the panel
+
+    def start_panel(self):
+        if self.arguments.discover or self.arguments.server_info:
+            return      # a report: printed as it is
+        self.panel = StatusPanel(fraction=self.PANEL_FRACTION)
+        if not self.panel.start():
+            self.panel = None
+            return
+        self.panel.on_resize = lambda: self.panel.update(self._panel_lines())
+        from sylkrtc.util import RepeatingTimer
+        self._panel_timer = RepeatingTimer(Statistics.TICK, self._update_panel)
+        self._panel_timer.start(0)
+        reactor.addSystemEventTrigger('after', 'shutdown', self.panel.stop)
+
+    def _update_panel(self):
+        try:
+            self.panel.update(self._panel_lines())
+        except Exception as e:
+            log.debug(f'status panel: {e}')
+
+    def _panel_lines(self):
+        """Our microphone on the left, every participant on the right (a meter, or L and R for one that sends stereo),
+        loss, round trip time and jitter between them; the traffic under them."""
+        session = self.session
+        audio = self.audio
+        footer = DIM + '── /help · r live RTP log · /a /o microphone/speakers · /devices · /who · /quit ' + '─' * 400 + RESET
+        out, incoming = None, []
+        for row in self.statistics.current:
+            if row['direction'] == 'out' and row['label'] in ('audio', 'audio+video'):
+                out = row
+            elif row['direction'] == 'in':
+                incoming.append(row)
+        channels = 2 if self.stereo else 1
+        muted = session is not None and session.audio_muted
+        title = f'{BOLD} {self.room_text}{RESET}  {session.state if session is not None else "starting"}'
+        if session is not None and session.state == 'established' and getattr(self, 'established_at', None):
+            seconds = int(reactor.seconds() - self.established_at)
+            title += f' {seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}' if seconds >= 3600 else f' {seconds // 60}:{seconds % 60:02d}'
+        if session is not None:
+            people = [participant for participant in session.participants.values() if participant.visible and not participant.parent]
+            title += f'  {DIM}{len(people)} other{"s" if len(people) != 1 else ""}' + (', stereo room' if session.stereo_room else '') + RESET
+        else:
+            people = []
+        if self.recording:
+            title += f'  {RED}{BOLD}● REC{RESET}'
+        if muted:
+            title += f'  {RED}{BOLD}MUTED{RESET}'
+
+        def milliseconds(seconds):
+            return None if seconds is None else 1000.0 * seconds
+        loss_out = None if out is None or out.get('loss_held') is None else 100.0 * out['loss_held']        # the worst of 10 s
+        losses = [100.0 * row['loss_held'] for row in incoming if row.get('loss_held') is not None]
+        loss_in = max(losses) if losses else None
+        rtt = milliseconds(out['rtt']) if out is not None else None
+        jitter_out = milliseconds(out['jitter']) if out is not None else None
+        jitters = [1000.0 * row['jitter'] for row in incoming if row['jitter'] is not None]
+        jitter_in = max(jitters) if jitters else None
+        # the network on the left (over the devices), the levels here
+        # as wide as the column: its width less the name (9), a space and the value (up to 8), and its rule (2)
+        lates = [100.0 * row['late_held'] for row in incoming if row.get('late_held') is not None]
+        totals = dict(lost_out=out.get('lost_total') if out is not None else None,
+                      lost_in=sum(row.get('lost_total') or 0 for row in incoming), late_in=sum(row.get('late_total') or 0 for row in incoming))
+        connection = getattr(session, 'connection', None) if session is not None else None
+        server_rtt = connection.rtt * 1000 if connection is not None and getattr(connection, 'rtt', None) is not None else None
+        network = network_lines(rtt, loss_out, loss_in, jitter_out, jitter_in, jitter=self.arguments.jitter, width=self.SIDEBAR_WIDTH - 26,
+                                late_in=max(lates) if lates else None, totals=totals, server_rtt=server_rtt)
+        groups = [SCALE]
+        # ours: the microphone (with --playback: the microphone, the music, then the total, all we send); then the participants
+        media = session.media if session is not None and session.media is not None and session.state == 'established' else None
+        mixer = getattr(media, 'send_mixer', None)
+        control = self.mixer_control
+        control.elsewhere = getattr(self, 'audio', None) is not None and self.audio.menu
+        total = out['level'] if out is not None else None
+        if mixer is not None:
+            for strip in mixer.strips:
+                if strip['name'] == 'total' and not self.arguments.total_out_level:
+                    continue        # the total (what is sent) only with --total-out-level
+                level = total if strip['name'] == 'total' else self.statistics.strip_levels.get(strip['name'])
+                label, style = control.label(media, 'send', strip['name'], strip['name'], muted=strip['name'] == 'mic' and muted)
+                groups.append((label, vu_meters(level, channels), style))
+        else:
+            label, style = control.label(media, 'send', 'mic', 'mic', muted=muted)
+            groups.append((label, vu_meters(total, channels), style))
+        groups.append(GAP)
+        if self.console is not None:
+            footer = DIM + '── ← → select · ↑ ↓ volume' + (' · p pause · n b next/back' if mixer is not None else '') + ' · 0-9 level · a/space hear it · v/o devices · m mute · Enter message · / command · ? help ' + '─' * 400 + RESET
+        by_name = {row['label']: row for row in incoming}
+        for participant in people:
+            row = by_name.get(participant.name)
+            level = row['level'] if row is not None else None
+            label, style = control.label(media, 'listen', participant.name, participant.name.partition('@')[0][:12], muted=participant.muted)
+            groups.append((label, vu_meters(level, 1), style))
+        sent = out['rate'] if out is not None and out['rate'] is not None else None
+        received = sum(row['rate'] for row in incoming if row['rate'] is not None) if incoming else None
+        info = [f' {BOLD}out{RESET} ' + (f'{human_rate(sent)} {human_bytes(out["bytes"])}' if sent is not None else '-')
+                + f'    {BOLD}in{RESET} ' + (f'{human_rate(received)} {human_bytes(sum(row["bytes"] for row in incoming))} from {len(incoming)} feed{"s" if len(incoming) != 1 else ""}' if received is not None else '-'),
+                f' {DIM}microphone{RESET} {audio.current("input")}    {DIM}speakers{RESET} {audio.current("output")}']
+        if mixer is not None and MixerControl.info(mixer):
+            info.append(MixerControl.info(mixer))
+        if getattr(self, 'audio', None) is not None and self.panel.columns >= self.SIDEBAR_WIDTH + 60:
+            lines = meter_panel(self.panel.height, self.panel.columns - self.SIDEBAR_WIDTH, title, groups, info, footer)
+            return with_sidebar(lines, network + [''] + self.audio.sidebar(), self.SIDEBAR_WIDTH)
+        return meter_panel(self.panel.height, self.panel.columns, title, groups, [network_text(rtt, loss_out, loss_in)] + info, footer)
+
     # The terminal
 
+    # Single keys (--playback): the mixer's arrows; Enter or t a chat message, / a command
+
+    KEYS_HELP = '''* keys (no Enter):
+    ← →    select a strip of the mixer (in the panel): the microphone (with --playback the music too; the total with --total-out-level), each participant
+    ↑ ↓    its volume (1 dB a press)
+    0-9    the selected one's volume: 0 off, 1 to 9 from -40 dB (barely heard) to 0 dB (full), 5 dB a step
+    a, space  hear the selected one of ours here too, or not: the amplifier (--monitor or --playback; headphones)
+    p      pause the music, or play it on (as m for the microphone)
+    n b    the next file of the music, the one before
+    m      mute / unmute the microphone
+    v o    the next microphone, the next speakers
+    d      the device menu (in the panel): ↑ ↓ to a device, Enter to use it (both ways for one that is both), v as
+           the microphone only, o as the speakers only; d or → closes it. ← from the mixer's
+           first strip opens it too: the arrows go from the devices to the mixer and back
+    r      log RTP statistics and audio levels every 2 s, or stop
+    Enter  type a chat message (t too)
+    /      type a command (/who, /invite, /devices, /input, /output, /quit, ...)
+    ?      this'''
+
+    def keys(self):
+        """Back to single keys (after a typed line, and at the start): with the panel (the mixer), or --playback."""
+        if self.console is not None and (self.arguments.playback or not self.arguments.no_panel):
+            self.console.ask_key(self.key)
+
+    def key(self, key):
+        """One key typed: True when a line is typed next."""
+        try:
+            return self._key(key)
+        except Exception:
+            log.exception(f'the key {key!r}')        # else lost: Twisted's own log is not shown
+            return False
+
+    def _key(self, key):
+        session = self.session
+        mixer = getattr(session.media, 'send_mixer', None) if session is not None and session.media is not None else None
+        audio = getattr(self, 'audio', None)
+        if audio is not None and audio.menu:
+            kinds = audio.menu_key(key)
+            if kinds is not None:
+                for kind in kinds:
+                    self._audio_switched(kind)      # (not the speakers while recording)
+                if self.panel is not None:
+                    self._update_panel()
+                return False
+        if key == 'left' and audio is not None and self.panel is not None and self.mixer_control.at_first(session.media if session is not None else None):
+            audio.open_menu()           # ← from the first strip of the mixer: the device menu, on its left
+            self._update_panel()
+            return False
+        if key in MixerControl.KEYS:
+            if self.mixer_control.key(session.media if session is not None else None, key) and self.panel is not None:
+                self._update_panel()
+            return False
+        if key in ('\n', 't'):
+            self.line_purpose = 'message'
+            print('message: ', end='', flush=True)
+            return True
+        if key == '/':
+            self.line_purpose = 'command'
+            print('/', end='', flush=True)
+            return True
+        if key in ('a', ' ') and session is not None and session.media is not None:
+            print('* ' + self.mixer_control.toggle_monitor(session.media))
+            if self.panel is not None:
+                self._update_panel()
+        elif key == 'p' and mixer is not None:
+            print('* music paused' if mixer.toggle_pause() else '* music on')
+        elif key in ('n', 'b') and mixer is not None:
+            mixer.next() if key == 'n' else mixer.previous()
+        elif key == 'd' and self.panel is not None:
+            self.audio.open_menu()          # in the panel: ↑ ↓ to a device, Enter (or v, o) to use it
+            self._update_panel()
+        elif key == 'd':
+            print('\n'.join(f'* {line}' for line in self.audio.lines()))
+        elif key in ('v', 'o'):
+            self._input(f'/{"input" if key == "v" else "output"}')      # as /input, /output: the next one
+        elif key in '0123456789' and session is not None and session.media is not None:
+            if self.mixer_control.set_level(session.media, int(key)) is not None and self.panel is not None:
+                self._update_panel()
+        elif key == 'm' and session is not None:
+            session.set_audio_muted(not session.audio_muted)
+            print('* microphone muted' if session.audio_muted else '* microphone on')
+        elif key == 'r':
+            print(f'* RTP statistics and audio levels every {self.statistics.LIVE_INTERVAL} s' if self.statistics.toggle_live() else '* RTP statistics off')
+        elif key in ('?', 'h'):
+            print(self.KEYS_HELP)
+        return False
+
     def input(self, line):
+        purpose, self.line_purpose = getattr(self, 'line_purpose', None), None
+        if purpose == 'command':
+            line = '/' + line if line else ''
+        try:
+            if purpose == 'message' and line.startswith('/'):
+                line = ' ' + line       # a message as typed, not a command
+            self._input(line)
+        finally:
+            self.keys()
+
+    def _input(self, line):
         if not line:
             return
         if getattr(self, 'log_file', None) is not None:
@@ -523,8 +776,13 @@ def main():
     client = SylkConference(arguments)
     client.log_file = log_file
     if not arguments.no_input and sys.stdin.isatty():
-        stdio.StandardIO(Console(client))
+        client.console = Console(client)
+        stdio.StandardIO(client.console)
+        reactor.callWhenRunning(client.keys)        # --playback: single keys
     reactor.addSystemEventTrigger('before', 'shutdown', client.leave)     # SIGINT and SIGTERM stop the reactor
+    client.panel = None
+    if not arguments.no_panel:
+        reactor.callWhenRunning(client.start_panel)
     reactor.callWhenRunning(client.start)
     reactor.run()
     client.report_recordings()

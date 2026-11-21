@@ -271,6 +271,7 @@ class Call(object):
         self._description_sent = False  # our offer or answer is out: candidates can go
         self._pending_candidates = []
         self._establish_timer = Timer(ESTABLISH_TIMEOUT, lambda: self.hangup('no media connection'))
+        self.ended_here = False         # we hung up (hangup()): else the far end, the server or the connection ended it
 
     def __repr__(self):
         return f'<Call {self.direction} {self.uri} {self.state}>'
@@ -333,6 +334,7 @@ class Call(object):
         if self.state in ('idle', 'terminated'):
             return
         self.log('hanging up' if self.state != 'incoming' else 'rejecting')
+        self.ended_here = True
         if self.connection is not None and self.connection.state == 'ready' and (self._created or self.direction == 'incoming'):
             self.connection.request(dict(sylkrtc='session-terminate', session=self.id))
         self._terminate(reason)

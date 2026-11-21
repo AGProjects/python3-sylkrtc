@@ -36,7 +36,7 @@ import time
 from sylkrtc.sdp import chosen_video_codec, complete_answer, cvo_id, has_media, ice_urls, mids, offered_codecs, with_cvo, with_opus_stereo
 
 
-__all__ = ['MediaFactory', 'RoomMedia', 'ExtraMedia', 'CallMedia', 'VideoFrame', 'media_missing', 'media_report', 'AudioDevice', 'audio_devices', 'RESOLUTIONS', 'parse_resolution', 'webrtcbin_stats']
+__all__ = ['MediaFactory', 'RoomMedia', 'ExtraMedia', 'CallMedia', 'VideoFrame', 'media_missing', 'media_report', 'AudioDevice', 'audio_devices', 'watch_audio_devices', 'SendMixer', 'playlist', 'GAIN_FLOOR', 'RESOLUTIONS', 'parse_resolution', 'webrtcbin_stats']
 
 
 log = logging.getLogger('sylkrtc.gst')
@@ -78,7 +78,7 @@ DEFAULT_FPS = 10
 # leaky queue drops what does not fit, a gap every time it fills
 RECEIVED_AUDIO_QUEUE = 2            # s
 SPEAKING_DB = -38               # dBFS peak of decoded audio above which a participant speaks
-LEVEL_INTERVAL = 150 * 1000000  # ns between level messages
+LEVEL_INTERVAL = 50 * 1000000   # ns between level messages (the panel shows them every 250 ms)
 
 REQUIRED_ELEMENTS = ['webrtcbin', 'nicesrc', 'decodebin', 'audioconvert', 'audioresample', 'audiomixer', 'volume',
                      'opusenc', 'rtpopuspay', 'fakesink', 'tee', 'queue']
@@ -150,19 +150,62 @@ class AudioDevice(object):
         return self.name
 
 
+class _DeviceWatch(object):
+    """A device monitor kept running: the system tells it when audio devices come and go (its bus, read in the
+    thread that posts to it: no main loop), and it tells the listeners; get_devices() is then what it knows."""
+
+    def __init__(self):
+        self.monitor = None
+        self.listeners = []
+
+    def start(self):
+        if self.monitor is None and _init():
+            monitor = Gst.DeviceMonitor.new()
+            monitor.add_filter('Audio/Source', None)
+            monitor.add_filter('Audio/Sink', None)
+            monitor.get_bus().set_sync_handler(self._on_message, None)
+            if monitor.start():
+                self.monitor = monitor
+        return self.monitor is not None
+
+    def _on_message(self, bus, message, data):
+        # the device provider's thread
+        if message.type in (Gst.MessageType.DEVICE_ADDED, Gst.MessageType.DEVICE_REMOVED, Gst.MessageType.DEVICE_CHANGED):
+            for listener in list(self.listeners):
+                try:
+                    listener()
+                except Exception as e:
+                    log.debug(f'audio devices: {e}')
+        return Gst.BusSyncReply.DROP
+
+
+_device_watch = _DeviceWatch()
+
+
+def watch_audio_devices(listener):
+    """listener() (called from any thread) whenever the system's audio devices change; whether the system can tell."""
+    if not _device_watch.start():
+        return False
+    _device_watch.listeners.append(listener)
+    return True
+
+
 def audio_devices():
-    """([inputs], [outputs]): the AudioDevices the system has now."""
+    """([inputs], [outputs]): the AudioDevices the system has now (those the device watch knows, once it runs)."""
     if not _init():
         return [], []
-    monitor = Gst.DeviceMonitor.new()
-    monitor.add_filter('Audio/Source', None)
-    monitor.add_filter('Audio/Sink', None)
-    started = monitor.start()
-    try:
-        devices = monitor.get_devices() or []
-    finally:
-        if started:
-            monitor.stop()
+    if _device_watch.monitor is not None:
+        devices = _device_watch.monitor.get_devices() or []
+    else:
+        monitor = Gst.DeviceMonitor.new()
+        monitor.add_filter('Audio/Source', None)
+        monitor.add_filter('Audio/Sink', None)
+        started = monitor.start()
+        try:
+            devices = monitor.get_devices() or []
+        finally:
+            if started:
+                monitor.stop()
     found = {'Audio/Source': [], 'Audio/Sink': []}
     for device in devices:
         for kind, chosen in found.items():
@@ -177,6 +220,9 @@ def _replace_audio(media, kind, description):
     """Use other speakers (kind output) or another microphone (input) in media's pipeline, running or not:
     description is auto, none, a GStreamer description or an AudioDevice."""
     sink = kind == 'output'
+    current = getattr(media, 'audio_output' if sink else 'audio_input', None)
+    if isinstance(description, AudioDevice) and isinstance(current, AudioDevice) and description.name == current.name:
+        return          # the one used already: nothing to replace
     setattr(media, 'audio_output' if sink else 'audio_input', description)
     pipeline = media.pipeline
     if pipeline is None:
@@ -186,6 +232,9 @@ def _replace_audio(media, kind, description):
     if old is None:
         raise RuntimeError(f'no {name} in the pipeline')
     new = RoomMedia._audio_element(media, description, name, sink)
+    channels = pipeline.get_by_name('micchannels') if not sink else None
+    if channels is not None:
+        channels.set_property('caps', _source_caps(description))      # a mono device mono, a stereo one as it is
     if sink:
         if new.find_property('async') is not None:
             new.set_property('async', False)        # no preroll to wait for in a playing pipeline
@@ -194,14 +243,23 @@ def _replace_audio(media, kind, description):
         if upstream is None:
             raise RuntimeError(f'the {name} are not linked')
 
-        def idle(pad, info):
-            # the thread that pushes to the speakers, between buffers (or right now)
-            pad.unlink(old_pad)
+        def retire():
+            # another thread: stopping an audio sink from the thread that feeds it can block it for good (macOS)
             old.set_state(Gst.State.NULL)
-            pipeline.remove(old)
+            # the latency told anew: a sink added to a live pipeline does not have it, takes every buffer as late
+            # and plays nothing
+            pipeline.recalculate_latency()
+
+        def idle(pad, info):
+            # the thread that pushes to the speakers, between buffers (or right now): relinked, nothing stopped here
+            pad.unlink(old_pad)
+            pipeline.remove(old)            # still running, out of the way (the new ones take its name), stopped in retire
             pipeline.add(new)
-            pad.link(new.get_static_pad('sink'))
+            result = pad.link(new.get_static_pad('sink'))
+            if result != Gst.PadLinkReturn.OK:
+                log.warning(f'the new speakers: cannot link them ({result.value_nick})')
             new.sync_state_with_parent()
+            threading.Thread(target=retire, name='retire-speakers', daemon=True).start()
             return Gst.PadProbeReturn.REMOVE
         upstream.add_probe(Gst.PadProbeType.IDLE, idle)
     else:
@@ -215,6 +273,7 @@ def _replace_audio(media, kind, description):
         if downstream is not None:
             new.get_static_pad('src').link(downstream)
         new.sync_state_with_parent()
+        pipeline.recalculate_latency()      # the new microphone's latency too
 
 
 def parse_resolution(text):
@@ -245,43 +304,73 @@ def _make(factory, name=None, **properties):
     return element
 
 
+def _channels(caps):
+    """The channel count of decoded audio caps, None when not fixed yet."""
+    try:
+        structure = caps.get_structure(0)
+        if structure.has_field('channels'):
+            value = structure.get_value('channels')
+            return value if isinstance(value, int) else None
+    except Exception:
+        pass
+    return None
+
+
+def _as_channels(level, channels):
+    """A level of _Levels.take with only the first channels channels: the decoded stream had that many, the others
+    are its copies (the audio is made stereo for the mixer and the speakers)."""
+    if level is None or not channels or len(level[2]) <= channels:
+        return level
+    kept = level[2][:channels]
+    return (max(rms for rms, peak in kept), max(peak for rms, peak in kept), kept)
+
+
 def _level(name):
     """A level element measuring the audio going through it every LEVEL_INTERVAL ([] without the level plugin)."""
     return [_make('level', name, interval=LEVEL_INTERVAL, post_messages=True)] if _has('level') else []
 
 
 class _Levels(object):
-    """The audio levels the level elements post (any thread): RMS averaged (in power) and peak maxed until taken."""
+    """The audio levels the level elements post (any thread), per channel: RMS averaged (in power) and peak maxed
+    until taken."""
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._levels = {}       # element name -> [power sum, count, peak max]
+        self._levels = {}       # element name -> [[power sum per channel], count, [peak max per channel]]
 
     def add(self, structure, name):
-        """A bus message's structure: the peak (dBFS) when it is a level one, else None."""
+        """A bus message's structure: the peak (dBFS, the loudest channel) when it is a level one, else None."""
         if structure is None or structure.get_name() != 'level':
             return None
         try:
-            rms = max(structure.get_value('rms') or [-100.0])
-            peak = max(structure.get_value('peak') or [-100.0])
+            rms = [max(-100.0, value) for value in (structure.get_value('rms') or [])] or [-100.0]
+            peak = [max(-100.0, value) for value in (structure.get_value('peak') or [])] or [-100.0]
         except (TypeError, ValueError):
             return None
-        rms, peak = max(-100.0, rms), max(-100.0, peak)
+        channels = min(len(rms), len(peak))
         with self._lock:
-            entry = self._levels.setdefault(name, [0.0, 0, -100.0])
-            entry[0] += 10 ** (rms / 10)
+            entry = self._levels.get(name)
+            if entry is None or len(entry[0]) != channels:
+                entry = self._levels[name] = [[0.0] * channels, 0, [-100.0] * channels]
+            for channel in range(channels):
+                entry[0][channel] += 10 ** (rms[channel] / 10)
+                entry[2][channel] = max(entry[2][channel], peak[channel])
             entry[1] += 1
-            entry[2] = max(entry[2], peak)
-        return peak
+        return max(peak)
 
     def take(self, name):
-        """(RMS dBFS, peak dBFS) since the last take, None when nothing was measured."""
+        """(RMS dBFS, peak dBFS, [(RMS dBFS, peak dBFS) per channel]) since the last take, None when nothing was
+        measured: the first two of all channels (power averaged, peak maxed)."""
         with self._lock:
             entry = self._levels.pop(name, None)
         if not entry or not entry[1]:
             return None
-        power = entry[0] / entry[1]
-        return (10 * math.log10(power) if power > 1e-10 else -100.0, entry[2])
+
+        def decibels(power):
+            return 10 * math.log10(power) if power > 1e-10 else -100.0
+        powers = [total / entry[1] for total in entry[0]]
+        channels = [(decibels(power), peak) for power, peak in zip(powers, entry[2])]
+        return (decibels(sum(powers) / len(powers)), max(entry[2]), channels)
 
 
 # Stereo audio (music: a stereo room, a stereo call): Opus in stereo at this
@@ -358,15 +447,340 @@ def _add_audio_level_extension(payloader, caps):
     return caps
 
 
+# What we send: the microphone, or (playback) the microphone and music mixed
+
+AUDIO_FILES = ('.mp3', '.flac', '.wav', '.ogg', '.oga', '.opus', '.m4a', '.aac', '.aif', '.aiff', '.wma')
+GAIN_FLOOR = -60.0          # dB: a strip at it or under it is off
+GAIN_TOP = 12.0
+
+
+def playlist(paths):
+    """The audio files of paths: the files given, and those of the folders given (and their folders), in order."""
+    found = []
+    for path in paths or []:
+        path = os.path.expanduser(path)
+        if os.path.isdir(path):
+            for root, folders, files in os.walk(path):
+                folders.sort()
+                found += [os.path.join(root, name) for name in sorted(files) if name.lower().endswith(AUDIO_FILES)]
+        elif os.path.isfile(path):
+            found.append(path)
+    return found
+
+
+def _send_audio(media, echo_cancellation, muted):
+    """The start of what media sends, up to what encodes it: our microphone (through the echo canceller, a volume for
+    mute and gain, made stereo for a stereo call or room) alone, or mixed with music when media.playback names audio
+    files (media.send_mixer). Linked, then _attach_send_audio(media)."""
+    convert = _make('audioconvert', 'micconvert')
+    microphone = [RoomMedia._audio_element(media, media.audio_input, 'microphone', sink=False)]
+    if media.stereo:
+        _upmix_from_source(convert)
+        microphone.append(_make('capsfilter', 'micchannels', caps=_source_caps(media.audio_input)))
+    microphone += [convert, _make('audioresample')]
+    if echo_cancellation:
+        microphone += [_make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,rate=48000,channels=1')), _make('webrtcdsp', 'dsp', probe='echoprobe')]
+    media._volume = _make('volume', 'micvolume', mute=muted)
+    media._volume.set_property('volume', _gain_value(getattr(media, 'mic_gain', 0.0)))
+    microphone += [media._volume, _make('audioconvert'), _make('audioresample')] + (_stereo_microphone() if media.stereo else [])
+    files = playlist(getattr(media, 'playback', None))
+    if getattr(media, 'playback', None) and not files:
+        log.warning(f'--playback: no audio files in {", ".join(media.playback)}: the microphone alone')
+    if not files:
+        media.send_mixer = None
+        return microphone + _level('miclevel') + _monitor_tee(media, 'mic')
+    media.send_mixer = SendMixer(media, files)
+    return media.send_mixer.head(microphone)
+
+
+def _attach_send_audio(media):
+    if getattr(media, 'send_mixer', None) is not None:
+        media.send_mixer.attach()
+    for key, tee in list(getattr(media, '_monitor_tees', {}).items()):
+        _attach_monitor(media, key, tee)
+
+
+# What we hear of ourselves (monitor, --monitor or --playback): our strips (the microphone, the music) mixed with what
+# we hear, right before the speakers, each on or off (off at first). For headphones: from speakers the microphone
+# would take it in again.
+
+MONITOR_CAPS = 'audio/x-raw,rate=48000,channels=2'
+
+
+def _monitor_head(media):
+    """The elements before the speakers that mix what we hear of ourselves in: [] without monitoring."""
+    media._monitor_mixer, media._monitor_tees, media._monitors = None, {}, {}
+    media.__dict__.setdefault('monitor_on', {})
+    if not getattr(media, 'monitor', False) or media.audio_output == 'none':
+        return []
+    media._monitor_mixer = _make('audiomixer', 'monitormixer', latency=40 * Gst.MSECOND, ignore_inactive_pads=True)
+    return [_make('audioconvert'), _make('audioresample'), _make('capsfilter', caps=Gst.Caps.from_string(MONITOR_CAPS)),
+            media._monitor_mixer]
+
+
+def _monitor_tee(media, key):
+    """A tee for what we hear of strip key ([] without monitoring); linked by _attach_monitor."""
+    if getattr(media, '_monitor_mixer', None) is None:
+        return []
+    tee = _make('tee', 'monitortee-' + key, allow_not_linked=True)
+    media._monitor_tees[key] = tee
+    return [tee]
+
+
+def _attach_monitor(media, key, tee):
+    branch = [_make('queue', max_size_time=200 * Gst.MSECOND, max_size_buffers=0, max_size_bytes=0, leaky='downstream'),
+              _make('audioconvert'), _make('audioresample'), _make('capsfilter', caps=Gst.Caps.from_string(MONITOR_CAPS)),
+              _make('volume', 'monitor-' + key, mute=not media.monitor_on.get(key, False))]
+    _link_chain(media.pipeline, branch)
+    _link_into(tee, branch[0])
+    _link_into(branch[-1], media._monitor_mixer)
+    media._monitors[key] = branch[-1]
+
+
+class SendMixer(object):
+    """What we send with playback: our microphone and music mixed, each a strip with its gain in dB (strips: mic,
+    music, and total for all of it; GAIN_FLOOR and under: off), for the console mixer. The music: the files given, one after the other, then
+    again from the first.
+
+        microphone -> ... -> volume (gain, mute) -> level ----------------------------\
+        music -> uridecodebin -> queue -> convert/resample -> volume (gain) -> level ---> audiomixer -> level (sent)
+    """
+
+    def __init__(self, media, files):
+        self.media = media
+        self.files = files
+        self.track = -1
+        self.title = None           # the file played
+        self.strips = [dict(name='mic', gain=getattr(media, 'mic_gain', 0.0), level='level-strip-mic'),
+                       dict(name='music', gain=getattr(media, 'playback_gain', None) if getattr(media, 'playback_gain', None) is not None else -6.0,
+                            level='level-strip-music'),
+                       dict(name='total', gain=0.0, level=None)]        # all we send (its level: what is sent, miclevel)
+        self.pipeline = None
+        self._decoder = None
+        self.paused = False
+        self._block = None          # the probe that holds the music while paused
+        self._paused_at = 0
+
+    def _running(self):
+        """The pipeline's running time now (ns), 0 before it plays."""
+        pipeline = self.pipeline
+        clock = pipeline.get_clock() if pipeline is not None else None
+        if clock is None or pipeline.get_state(0)[1] != Gst.State.PLAYING:
+            return 0
+        return max(0, clock.get_time() - pipeline.get_base_time())
+
+    def toggle_pause(self):
+        """p: the music held where it is, or on again from there (its time moved on by the pause, else the mixer
+        would take what was held as late): whether it is paused now."""
+        if self.pipeline is None:
+            return self.paused
+        held = self._music[0].get_static_pad('src')        # the queue's: the decoder fills it, then waits
+        if not self.paused:
+            self._paused_at = self._running()
+            self._block = held.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, lambda pad, info: Gst.PadProbeReturn.OK)
+            self.paused = True
+            log.info(f'playback: {self.title} paused')
+        else:
+            after = self._music[1].get_static_pad('sink')
+            after.set_offset(after.get_offset() + self._running() - self._paused_at)
+            if self._block is not None:
+                held.remove_probe(self._block)
+            self._block, self.paused = None, False
+            log.info(f'playback: {self.title} on again')
+        return self.paused
+
+    def head(self, microphone):
+        """The elements from the mixer on (to what encodes), the microphone's kept to be linked into it."""
+        channels = 2 if self.media.stereo else 1
+        self._caps = Gst.Caps.from_string(f'audio/x-raw,rate=48000,channels={channels}')
+        self._microphone = microphone + [_make('capsfilter', caps=self._caps)] + _level('level-strip-mic') + _monitor_tee(self.media, 'mic')
+        self._music_volume = _make('volume', 'musicgain')
+        self._music = [_make('queue', 'musicqueue', max_size_time=2 * Gst.SECOND), _make('audioconvert'), _make('audioresample'),
+                       _make('capsfilter', caps=self._caps), self._music_volume] + _level('level-strip-music') + _monitor_tee(self.media, 'music')
+        self.mixer = _make('audiomixer', 'sendmixer')
+        self._master = _make('volume', 'mastergain')
+        return [self.mixer, _make('audioconvert'), _make('capsfilter', caps=self._caps), self._master] + _level('miclevel')
+
+    def attach(self):
+        """Once the mixer is in the pipeline: the microphone and the music linked into it, the first file played."""
+        self.pipeline = pipeline = self.media.pipeline
+        for chain in (self._microphone, self._music):
+            _link_chain(pipeline, chain)
+            _link_into(chain[-1], self.mixer)
+        # where the music comes in: a file's end goes no further (the queue would stop at it), the next file instead
+        self._music[0].get_static_pad('sink').add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_music_event)
+        for index, strip in enumerate(self.strips):
+            self.set_gain(index, strip['gain'])
+        # at a random file with playback_random (then on in order), else at the first
+        self._play(random.randrange(len(self.files)) if getattr(self.media, 'playback_random', False) else 0)
+
+    def _element(self, index):
+        return {'mic': self.media._volume, 'music': self._music_volume, 'total': self._master}[self.strips[index]['name']]
+
+    def set_gain(self, index, gain):
+        """A strip's gain, in dB (GAIN_FLOOR to GAIN_TOP; GAIN_FLOOR: off)."""
+        gain = min(GAIN_TOP, max(GAIN_FLOOR, gain))
+        self.strips[index]['gain'] = gain
+        element = self._element(index)
+        if element is not None:
+            element.set_property('volume', 0.0 if gain <= GAIN_FLOOR else 10 ** (gain / 20))
+
+    def levels(self):
+        """{(strip name, 'strip'): level} since the last call (of each strip, after its gain)."""
+        found = {}
+        for strip in self.strips:
+            if strip['level'] is None:
+                continue        # the total: what is sent, in media.levels() already
+            level = self.media._levels.take(strip['level'])
+            if level is not None:
+                found[(strip['name'], 'strip')] = level
+        return found
+
+    def _play(self, index):
+        pipeline = self.pipeline
+        if pipeline is None or self.media.pipeline is not pipeline:
+            return
+        old, self._decoder = self._decoder, None
+        if old is not None:
+            old.set_state(Gst.State.NULL)
+            pipeline.remove(old)
+        if self.paused:
+            self.toggle_pause()         # another file: played (from its start, now)
+        self._music[1].get_static_pad('sink').set_offset(0)        # no pause in it yet
+        self.track = index % len(self.files)
+        path = self.files[self.track]
+        self.title = os.path.splitext(os.path.basename(path))[0]
+        decoder = _make('uridecodebin', 'musicdecoder', uri=Gst.filename_to_uri(path))
+        decoder.connect('pad-added', self._on_decoded)
+        # the file's time starts now (in the pipeline's running time): what was mixed goes on
+        clock = pipeline.get_clock()
+        running = clock.get_time() - pipeline.get_base_time() if clock is not None and pipeline.get_state(0)[1] == Gst.State.PLAYING else 0
+        self._music[0].get_static_pad('sink').set_offset(max(0, running))
+        self._decoder = decoder
+        pipeline.add(decoder)
+        decoder.sync_state_with_parent()
+        log.info(f'playback: {self.title} ({self.track + 1} of {len(self.files)})')
+
+    def _on_decoded(self, decoder, pad):
+        # streaming thread
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        sink = self._music[0].get_static_pad('sink')
+        if caps is not None and caps.get_size() and caps.get_structure(0).get_name().startswith('audio/') and not sink.is_linked():
+            pad.link(sink)
+        else:
+            discard = _make('fakesink', sync=False)
+            discard.set_property('async', False)
+            self.pipeline.add(discard)
+            discard.sync_state_with_parent()
+            pad.link(discard.get_static_pad('sink'))
+
+    def _on_music_event(self, pad, info):
+        # streaming thread: at the end of a file, not the end of the music, the next one instead
+        event = info.get_event()
+        if event is not None and event.type == Gst.EventType.EOS:
+            from twisted.internet import reactor
+            reactor.callFromThread(self.next)
+            return Gst.PadProbeReturn.DROP
+        return Gst.PadProbeReturn.OK
+
+    def next(self):
+        """The next file (after the last one, the first)."""
+        self._play(self.track + 1)
+
+    def previous(self):
+        self._play(self.track - 1)
+
+
+MONO_TO_STEREO = '<<(float)1.0>, <(float)1.0>>'                                 # one channel in, in both out
+STEREO_TO_STEREO = '<<(float)1.0, (float)0.0>, <(float)0.0, (float)1.0>>'      # as it is
+
+
+def _stereo_microphone():
+    """What makes our microphone two channels (after _upmix_from_source on its first audioconvert)."""
+    return [_stereo_caps()]
+
+
+def _device_channels(description):
+    """How many channels the input device of description has (auto: the system's default one), None if not known."""
+    device = description
+    if not isinstance(device, AudioDevice):
+        if description not in (None, '', 'auto'):
+            return None         # a GStreamer description: as it gives it
+        inputs, outputs = audio_devices()
+        device = next((each for each in inputs if each.default), inputs[0] if inputs else None)
+        if device is None:
+            return None
+    try:
+        caps = device.device.get_caps()
+        found = []
+        for index in range(caps.get_size() if caps is not None else 0):
+            value = caps.get_structure(index).get_value('channels') if caps.get_structure(index).has_field('channels') else None
+            if isinstance(value, int):
+                found.append(value)
+        return max(found) if found else None
+    except Exception:
+        return None
+
+
+def _source_caps(description):
+    """The caps our microphone may give, in stereo: its own channel count when it is a mono device (one channel,
+    not two of which macOS fills the left only, as it does when two are asked of a mono device)."""
+    channels = _device_channels(description)
+    if channels == 1:
+        log.info(f'our microphone ({description if isinstance(description, AudioDevice) else "the system default"}) is mono: sent in both channels')
+        return Gst.Caps.from_string('audio/x-raw,channels=1')
+    log.info(f'our microphone has {channels if channels is not None else "an unknown number of"} channels: sent as it gives them')
+    return Gst.Caps.from_string('audio/x-raw')
+
+
+def _upmix_from_source(convert):
+    """Our microphone in stereo: a mono one in both channels, equal, at full level; a stereo one as it is. Set on the
+    audioconvert right after the microphone (its mix-matrix, from the caps the microphone gives), where the channels
+    become two: a mono microphone that says its one channel is the front left one (macOS does) would else go to the
+    left only (the first audioconvert makes it stereo by position, before anything after it could)."""
+
+    def on_event(pad, info):
+        # the microphone's thread, before the audioconvert takes the caps
+        event = info.get_event()
+        if event is not None and event.type == Gst.EventType.CAPS:
+            channels = _channels(event.parse_caps())
+            if channels in (1, 2):
+                Gst.util_set_object_arg(convert, 'mix-matrix', MONO_TO_STEREO if channels == 1 else STEREO_TO_STEREO)
+                log.info('our microphone is mono: sent in both channels' if channels == 1 else 'our microphone is stereo: sent as it is')
+        return Gst.PadProbeReturn.OK
+    convert.get_static_pad('sink').add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, on_event)
+    return convert
+
+
 def _stereo_caps():
-    return _make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,channels=2'))
+    """Two channels, after an audioconvert: a mono microphone goes in both, equal (audioconvert copies mono to left
+    and right at full level), a stereo source stays as it is."""
+    return _make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,channels=2,channel-mask=(bitmask)0x3'))
+
+
+def _link_into(element, other):
+    """element's src pad (requested, for a tee) to a requested sink pad of other (a mixer), or to other's sink pad;
+    RuntimeError with why not."""
+    source = element.get_static_pad('src') or element.request_pad_simple('src_%u')
+    sink = other.get_static_pad('sink') or other.request_pad_simple('sink_%u')
+    if source is None or sink is None:
+        raise RuntimeError(f'cannot link {element.get_name()} to {other.get_name()}: no pad (' +
+                           ('none from ' + element.get_name() if source is None else 'none from ' + other.get_name()) + ')')
+    result = source.link(sink)
+    if result != Gst.PadLinkReturn.OK:
+        parents = f'{getattr(element.get_parent(), "get_name", lambda: None)()}, {getattr(other.get_parent(), "get_name", lambda: None)()}'
+        raise RuntimeError(f'cannot link {element.get_name()} to {other.get_name()}: {result.value_nick} (in {parents})')
 
 
 def _link_chain(pipeline, elements, add=True):
     if add:
         for element in elements:
-            pipeline.add(element)
+            if not pipeline.add(element):
+                raise RuntimeError(f'cannot add {element.get_name()} to the pipeline (a name taken?)')
     for left, right in zip(elements, elements[1:]):
+        if left.get_static_pad('src') is None:         # a tee: a pad of its own for each output
+            _link_into(left, right)
+            continue
         if not left.link(right):
             raise RuntimeError(f'cannot link {left.get_name()} to {right.get_name()}')
 
@@ -410,6 +824,19 @@ def connection_state(webrtcbin):
     ice = webrtcbin.get_property('ice-connection-state')
     connection = webrtcbin.get_property('connection-state')
     return f'ICE {getattr(ice, "value_nick", ice)}, connection {getattr(connection, "value_nick", connection)}'
+
+
+def _receiving(webrtcbin, media):
+    """A webrtcbin that receives: its jitter buffer as long as media.jitter_buffer (ms, else webrtcbin's 200), and
+    its jitter buffers kept, for the packets they drop as late (see webrtcbin_stats): those come, but after their
+    time; they are no loss (no sequence number is missing), they are heard as gaps."""
+    latency = getattr(media, 'jitter_buffer', None)
+    if latency:
+        webrtcbin.set_property('latency', int(latency))
+    webrtcbin._jitterbuffers = []
+    rtpbin = webrtcbin.get_by_name('rtpbin')
+    if rtpbin is not None:
+        rtpbin.connect('new-jitterbuffer', lambda bin, jitterbuffer, session, ssrc: webrtcbin._jitterbuffers.append(jitterbuffer))
 
 
 def _configure_ice(webrtcbin, ice_servers):
@@ -509,7 +936,15 @@ class MediaFactory(object):
     """
 
     def __init__(self, audio_input='auto', audio_output='auto', video_sink=None, video_source=None, record_tracks=None,
-                 track_paths=None, stereo=False):
+                 track_paths=None, stereo=False, playback=None, monitor=False, playback_gain=None, mic_gain=0.0, jitter_buffer=None,
+                 playback_random=False):
+        self.playback = playback                # audio files (or folders) mixed into what we send, see SendMixer
+        self.monitor = bool(monitor or playback)    # what we send, heard here too (see _monitor_head)
+        self.monitor_on = {'mic': True, 'music': True} if monitor else {}     # --monitor: heard from the start
+        self.playback_gain = playback_gain          # the music's gain at first (dB), else SendMixer's default
+        self.mic_gain = mic_gain                    # our input device's gain at first (dB)
+        self.jitter_buffer = jitter_buffer          # ms of the jitter buffer (webrtcbin's latency), None: 200
+        self.playback_random = playback_random      # the music from a random file of it, not the first
         self.audio_input = audio_input
         self.audio_output = audio_output
         self.video_sink = video_sink
@@ -521,10 +956,78 @@ class MediaFactory(object):
     def __call__(self, session):
         media = RoomMedia(session, self.audio_input, self.audio_output, self.video_sink, self.video_source, self.stereo)
         media.record_tracks, media.track_paths = self.record_tracks, self.track_paths
+        media.playback, media.send_mixer, media.monitor = self.playback, None, self.monitor
+        media.monitor_on = dict(self.monitor_on)
+        media.playback_gain = self.playback_gain
+        media.mic_gain = self.mic_gain
+        media.jitter_buffer = self.jitter_buffer
+        media.playback_random = self.playback_random
         return media
 
 
-class RoomMedia(object):
+def _gain_value(gain):
+    """A volume element's volume for a gain in dB (GAIN_FLOOR: 0, off)."""
+    return 0.0 if gain <= GAIN_FLOOR else 10 ** (gain / 20)
+
+
+class _Strips(object):
+    """The console mixer of a media (RoomMedia, CallMedia): what we send (the microphone; with playback the music and
+    the total too, see SendMixer), then what we hear (the far end, or each participant: a volume each before the
+    speakers), each a strip with a gain in dB. The media gives _listen(): [(key, name)] of what we hear."""
+
+    mic_gain = 0.0
+
+    def _listen(self):
+        return []
+
+    def mixer_strips(self):
+        """[dict(kind ('send' or 'listen'), key, name, gain)], in the order of the panel."""
+        if getattr(self, 'send_mixer', None) is not None:
+            strips = [dict(kind='send', key=strip['name'], name=strip['name'], gain=strip['gain']) for strip in self.send_mixer.strips]
+        else:
+            strips = [dict(kind='send', key='mic', name='mic', gain=self.mic_gain)]
+        monitors, on = getattr(self, '_monitors', {}), self.__dict__.setdefault('monitor_on', {})
+        for strip in strips:
+            strip['monitor'] = on.get(strip['key'], False) if strip['key'] in monitors else None     # None: not to be heard here
+        gains = self.__dict__.setdefault('listen_gains', {})
+        return strips + [dict(kind='listen', key=key, name=name, gain=gains.get(key, 0.0), monitor=None) for key, name in self._listen()]
+
+    def set_strip_monitor(self, key, on):
+        """Whether we hear strip key (mic, music) here too: False when it cannot be (no monitoring)."""
+        volume = getattr(self, '_monitors', {}).get(key)
+        if volume is None:
+            return False
+        self.__dict__.setdefault('monitor_on', {})[key] = bool(on)
+        volume.set_property('mute', not on)
+        return True
+
+    def set_strip_gain(self, kind, key, gain):
+        gain = min(GAIN_TOP, max(GAIN_FLOOR, gain))
+        if kind == 'send':
+            mixer = getattr(self, 'send_mixer', None)
+            if mixer is not None:
+                names = [strip['name'] for strip in mixer.strips]
+                if key in names:
+                    mixer.set_gain(names.index(key), gain)
+            elif key == 'mic':
+                self.mic_gain = gain
+                if getattr(self, '_volume', None) is not None:
+                    self._volume.set_property('volume', _gain_value(gain))
+        else:
+            self.__dict__.setdefault('listen_gains', {})[key] = gain       # kept for a feed made later, too
+            volume = self.__dict__.setdefault('_listen_volumes', {}).get(key)
+            if volume is not None:
+                volume.set_property('volume', _gain_value(gain))
+
+    def _listen_volume(self, key, name):
+        """The volume element of what we hear from key, at its gain."""
+        volume = _make('volume', name)
+        volume.set_property('volume', _gain_value(self.__dict__.setdefault('listen_gains', {}).get(key, 0.0)))
+        self.__dict__.setdefault('_listen_volumes', {})[key] = volume
+        return volume
+
+
+class RoomMedia(_Strips):
     """video_source: our own video (session.video), as an extra video's source: dict(kind='v4l2', device, resolution, fps)
     or dict(kind='test', pattern, resolution, fps); the extra videos are shown under it."""
 
@@ -568,6 +1071,7 @@ class RoomMedia(object):
         playback = [self._mixer] + ([_stereo_caps()] if self.stereo else []) + [_make('audioconvert'), _make('audioresample')]
         if echo_cancellation:
             playback.append(_make('webrtcechoprobe', 'echoprobe'))
+        playback += _monitor_head(self)
         playback.append(self._audio_element(self.audio_output, 'speakers', sink=True))
         _link_chain(self.pipeline, playback)
 
@@ -576,13 +1080,9 @@ class RoomMedia(object):
         self.pipeline.add(webrtcbin)
         self._watch_webrtcbin(webrtcbin, self.session.id)
 
-        microphone = [self._audio_element(self.audio_input, 'microphone', sink=False), _make('audioconvert'), _make('audioresample')]
-        if echo_cancellation:
-            microphone += [_make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,rate=48000,channels=1')), _make('webrtcdsp', 'dsp', probe='echoprobe')]
-        self._volume = _make('volume', 'micvolume', mute=self.session.audio_muted)
+        microphone = _send_audio(self, echo_cancellation, self.session.audio_muted)
         payloader = _make('rtpopuspay', pt=OPUS_PT)
-        microphone += [self._volume] + _level('miclevel') + [_make('audioconvert'), _make('audioresample')] + ([_stereo_caps()] if self.stereo else []) + \
-                      _audio_level_meter() + [
+        microphone += _audio_level_meter() + [
                        _make('queue', max_size_time=200 * Gst.MSECOND, leaky='downstream'),
                        _opus_encoder(self.stereo),
                        payloader]
@@ -591,6 +1091,7 @@ class RoomMedia(object):
             log.info('our audio carries its level (ssrc-audio-level, RFC 6464): the room shows when we talk')
         microphone.append(_make('capsfilter', caps=audio_caps))
         _link_chain(self.pipeline, microphone)
+        _attach_send_audio(self)
         audio_pad = webrtcbin.request_pad_simple('sink_%u')
         transceiver = audio_pad.get_property('transceiver')
         # listening only (session.listen_only: a recorder): offered inactive, nothing of ours sent
@@ -702,6 +1203,7 @@ class RoomMedia(object):
 
     def add_feed(self, participant, sdp):
         webrtcbin = _make('webrtcbin', 'feed-' + participant.feed, bundle_policy='max-bundle')
+        _receiving(webrtcbin, self)
         _configure_ice(webrtcbin, self.session.ice_servers)
         participant.media = dict(webrtcbin=webrtcbin, elements=[webrtcbin], mixer_pads=[], cvo_id=cvo_id(sdp))
         self.pipeline.add(webrtcbin)
@@ -772,9 +1274,11 @@ class RoomMedia(object):
         if kind.startswith('audio/'):
             chain = [_make('queue', max_size_buffers=0, max_size_bytes=0, max_size_time=RECEIVED_AUDIO_QUEUE * Gst.SECOND, leaky='downstream'), _make('audioconvert'), _make('audioresample'),
                      _make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,rate=48000,channels=2'))]
+            participant.media['channels'] = _channels(caps)     # 1: a mono participant, 2: a stereo one
             tee = _make('tee') if self.record_tracks else None
             if tee is not None:         # its own file too (record_tracks), from the tee
                 chain += [tee, _make('queue')]
+            chain.append(self._listen_volume(participant.name, 'listen-' + participant.feed))
             if _has('level'):
                 chain.append(_make('level', 'level-' + participant.feed, interval=LEVEL_INTERVAL, post_messages=True))
             self._add_branch(participant, chain, pad)
@@ -876,7 +1380,11 @@ class RoomMedia(object):
         for track in list(self._tracks):
             self._end_track(track, later=False)
 
+    def _listen(self):
+        return [(participant.name, participant.name) for participant in list(self.session.feeds.values()) if participant.media]
+
     def remove_feed(self, participant):
+        self.__dict__.setdefault('_listen_volumes', {}).pop(participant.name, None)
         track = (participant.media or {}).get('track')
         if track is not None and self.pipeline is not None:
             self._end_track(track)          # (its elements not the feed's: they go a moment later)
@@ -906,7 +1414,7 @@ class RoomMedia(object):
         return found
 
     def levels(self):
-        """{(label, direction): (RMS dBFS, peak dBFS)} since the last call, labelled as in stats(): what our microphone
+        """{(label, direction): (RMS dBFS, peak dBFS, per channel)} since the last call, labelled as in stats(): what our microphone
         sends, what every feed plays."""
         found = {}
         mic = self._levels.take('miclevel')
@@ -914,9 +1422,11 @@ class RoomMedia(object):
             found[('audio+video' if self._video_pad is not None else 'audio', 'out')] = mic
         for participant in list(self.session.feeds.values()):
             if participant.media:
-                level = self._levels.take('level-' + participant.feed)
+                level = _as_channels(self._levels.take('level-' + participant.feed), participant.media.get('channels'))
                 if level is not None:
                     found[(participant.name, 'in')] = level
+        if getattr(self, 'send_mixer', None) is not None:
+            found.update(self.send_mixer.levels())
         return found
 
     # Extra videos
@@ -1158,7 +1668,7 @@ class VideoFrame(object):
         self.data = data
 
 
-class CallMedia(object):
+class CallMedia(_Strips):
     """The media of a 1 to 1 call: one webrtcbin carrying audio and video both ways.
 
         microphone -> [webrtcdsp] -> volume (mute) -> opusenc -> rtpopuspay ------------> webrtcbin
@@ -1178,9 +1688,16 @@ class CallMedia(object):
     FPS = 15
 
     def __init__(self, call, audio_input='auto', audio_output='auto', video_source=None, video_output=None, ice_servers=None, video_size=None,
-                 stereo=False):
+                 stereo=False, playback=None, monitor=False):
         self.call = call
         self.stereo = stereo
+        self.monitor = bool(monitor or playback)    # what we send, heard here too (see _monitor_head)
+        self.monitor_on = {'mic': True, 'music': True} if monitor else {}     # --monitor: heard from the start
+        self.playback_gain = None                   # the music's gain at first (dB), else SendMixer's default
+        self.jitter_buffer = None                   # ms of the jitter buffer (webrtcbin's latency), None: 200
+        self.playback_random = False                # the music from a random file of it, not the first
+        self.playback = playback        # audio files (or folders of them) mixed into what we send, see SendMixer
+        self.send_mixer = None
         self.audio_input = audio_input
         self.audio_output = audio_output
         self.video_source = video_source
@@ -1219,11 +1736,13 @@ class CallMedia(object):
         playback = [_make('audioconvert', 'playback'), _make('audioresample')]
         if echo_cancellation:
             playback.append(_make('webrtcechoprobe', 'echoprobe'))
+        playback += _monitor_head(self)
         playback.append(RoomMedia._audio_element(self, self.audio_output, 'speakers', sink=True))
         _link_chain(self.pipeline, playback)
         self._playback = playback[0]
 
         self.webrtcbin = webrtcbin = _make('webrtcbin', 'call', bundle_policy='max-bundle')
+        _receiving(webrtcbin, self)
         _configure_ice(webrtcbin, self.ice_servers)
         self.pipeline.add(webrtcbin)
         call = self.call
@@ -1240,16 +1759,14 @@ class CallMedia(object):
         if offer and not any(name == 'OPUS' for name, pt, rate, channels, fmtp in audio_codecs):
             raise RuntimeError('the call offers no OPUS audio')
 
-        microphone = [RoomMedia._audio_element(self, self.audio_input, 'microphone', sink=False), _make('audioconvert'), _make('audioresample')]
-        if echo_cancellation:
-            microphone += [_make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,rate=48000,channels=1')), _make('webrtcdsp', 'dsp', probe='echoprobe')]
-        self._volume = _make('volume', 'micvolume', mute=self.call.audio_muted)
+        microphone = _send_audio(self, echo_cancellation, self.call.audio_muted)
         audio_caps = _opus_caps(opus_pt, self.stereo)
-        microphone += [self._volume] + _level('miclevel') + [_make('audioconvert'), _make('audioresample')] + ([_stereo_caps()] if self.stereo else []) + [
+        microphone += [
                        _make('queue', max_size_time=200 * Gst.MSECOND, leaky='downstream'),
                        _opus_encoder(self.stereo),
                        _make('rtpopuspay', pt=opus_pt), _make('capsfilter', caps=audio_caps)]
         _link_chain(self.pipeline, microphone)
+        _attach_send_audio(self)
         audio_pad = webrtcbin.request_pad_simple('sink_%u')
         transceiver = audio_pad.get_property('transceiver')
         transceiver.set_property('direction', GstWebRTC.WebRTCRTPTransceiverDirection.SENDRECV)
@@ -1449,7 +1966,8 @@ class CallMedia(object):
         if kind.startswith('audio/'):
             chain = [_make('queue', max_size_buffers=0, max_size_bytes=0, max_size_time=RECEIVED_AUDIO_QUEUE * Gst.SECOND, leaky='downstream'), _make('audioconvert'), _make('audioresample'),
                      _make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,rate=48000,channels=2'))]
-            chain += _level('level-remote')
+            chain += [self._listen_volume('remote', 'listen-remote')] + _level('level-remote')
+            self._remote_channels = _channels(caps)
             playback = self._playback.get_static_pad('sink')
             if playback.is_linked():
                 self._discard(pad)      # a second audio stream: not expected in a call
@@ -1532,19 +2050,27 @@ class CallMedia(object):
         if self.webrtcbin is None:
             return []
         stats = webrtcbin_stats(self.webrtcbin)
-        out = dict(stats, received_bytes=0, received_packets=0, lost_received=0, jitter_received=None)
+        out = dict(stats, received_bytes=0, received_packets=0, lost_received=0, jitter_received=None, late_received=0)
         incoming = dict(stats, sent_bytes=0, sent_packets=0, lost_sent=None, fraction_lost_sent=None, rtt=None, jitter_sent=None)
         return [('audio+video' if self._camera_linked else 'audio', 'out', out),
                 ('audio+video' if self._remote_size else 'audio', 'in', incoming)]
 
+    def _listen(self):
+        return [('remote', self.call.peer)]
+
     def levels(self):
-        """{(label, direction): (RMS dBFS, peak dBFS)} since the last call, labelled as in stats()."""
+        """{(label, direction): (RMS dBFS, peak dBFS, per channel)} since the last call, labelled as in stats(): the
+        far end's channels as it sends them (1 or 2)."""
         found = {}
         for name, key in (('miclevel', ('audio+video' if self._camera_linked else 'audio', 'out')),
                           ('level-remote', ('audio+video' if self._remote_size else 'audio', 'in'))):
             level = self._levels.take(name)
+            if name == 'level-remote':
+                level = _as_channels(level, getattr(self, '_remote_channels', None))
             if level is not None:
                 found[key] = level
+        if self.send_mixer is not None:
+            found.update(self.send_mixer.levels())
         return found
 
     def _on_bus_message(self, bus, message, data):
@@ -1571,11 +2097,18 @@ class CallMedia(object):
 def webrtcbin_stats(webrtcbin):
     """What a webrtcbin sent and received so far: dict(sent_bytes, sent_packets, received_bytes, received_packets,
     lost_received, lost_sent (cumulative, None when not reported), fraction_lost_sent (last report), rtt, jitter_received
-    (ours), jitter_sent (the far end's report) (seconds, None when unknown)). Blocks for the answer (it is quick)."""
+    (ours), jitter_sent (the far end's report) (seconds, None when unknown), late_received (packets that came after
+    their time, dropped by the jitter buffer: heard as gaps, not loss)). Blocks for the answer (it is quick)."""
     totals = dict(sent_bytes=0, sent_packets=0, received_bytes=0, received_packets=0, lost_received=0, lost_sent=None,
-                  fraction_lost_sent=None, rtt=None, jitter_received=None, jitter_sent=None)
+                  fraction_lost_sent=None, rtt=None, jitter_received=None, jitter_sent=None, late_received=0)
     if webrtcbin is None:
         return totals
+    for jitterbuffer in list(getattr(webrtcbin, '_jitterbuffers', [])):
+        try:
+            stats = jitterbuffer.get_property('stats')
+            totals['late_received'] += stats.get_value('num-late') or 0
+        except Exception:
+            pass
     promise = Gst.Promise.new()
     webrtcbin.emit('get-stats', None, promise)
     if promise.wait() != Gst.PromiseResult.REPLIED:

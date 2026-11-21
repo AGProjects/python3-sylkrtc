@@ -30,6 +30,8 @@ Everything runs in the reactor thread.
 
 import json
 import logging
+import os
+import time
 import uuid
 
 from hashlib import md5
@@ -42,7 +44,7 @@ from twisted.internet import reactor
 
 from sylkrtc import PROTOCOL
 from sylkrtc.device import USER_AGENT, device_id, device_name
-from sylkrtc.util import Timer, run_in_reactor
+from sylkrtc.util import RepeatingTimer, Timer, run_in_reactor
 
 
 __all__ = ['Connection', 'Connections', 'ha1', 'DEFAULT_USER_AGENT']
@@ -53,6 +55,7 @@ log = logging.getLogger('sylkrtc.connection')
 PING_INTERVAL = 30      # s, a WebSocket ping keeps NATs and proxies from dropping the connection
 PING_TIMEOUT = 20       # s without pong: the connection is dead
 CONNECT_TIMEOUT = 15    # s until ready-event
+PING_INTERVAL = 5       # s between WebSocket pings, timed: the round trip to the server (rtt)
 REQUEST_TIMEOUT = 20    # s without ack or error: the request failed
 
 DEFAULT_USER_AGENT = USER_AGENT     # the same for every tool: one device on the server (sylkrtc.device)
@@ -70,6 +73,9 @@ class _Protocol(WebSocketClientProtocol):
     def onMessage(self, payload, is_binary):
         if not is_binary:
             self.factory.connection._received(payload.decode('utf-8', 'replace'))
+
+    def onPong(self, payload):
+        self.factory.connection._pong(payload)
 
     def onClose(self, was_clean, code, reason):
         self.factory.connection._disconnected(reason or (f'code {code}' if code else 'disconnected'))
@@ -105,6 +111,9 @@ class Connection(object):
         self.server = None              # the Server header of the handshake (SylkServer/<version>)
         self.subprotocol = None
         self.connect_time = None        # s from open to ready-event
+        self.rtt = None                 # s: the round trip of the latest WebSocket ping (to the server, not the far end)
+        self._ping = None               # (payload, when sent)
+        self._pinger = RepeatingTimer(PING_INTERVAL, self._send_ping)
         self._pending_accounts = {}     # identity -> callbacks waiting for account-add
         self._queue = []                # requests made before ready
         self._transactions = {}         # transaction -> (request name, callback, timer)
@@ -170,6 +179,8 @@ class Connection(object):
             return
         self.state = 'closed'
         self._connect_timer.stop()
+        self._pinger.stop()
+        self.rtt = None
         self.accounts.clear()
         pending = [callback for callbacks in self._pending_accounts.values() for callback in callbacks]
         self._pending_accounts.clear()
@@ -225,6 +236,7 @@ class Connection(object):
         if kind == 'ready-event':
             self._connect_timer.stop()
             self.state = 'ready'
+            self._pinger.start(0)
             self.connect_time = reactor.seconds() - self._opened
             features = message.get('features')
             self.features = {feature for feature in features if isinstance(feature, str)} if isinstance(features, list) else set()
@@ -263,6 +275,21 @@ class Connection(object):
         text = json.dumps(data)
         log.debug(f'sending {text if data.get("sylkrtc") != "account-add" else data["sylkrtc"]}')
         self._protocol.sendMessage(text.encode('utf-8'), isBinary=False)
+
+    def _send_ping(self):
+        if self._protocol is None or self.state != 'ready':
+            return
+        payload = os.urandom(8)
+        self._ping = (payload, time.monotonic())
+        try:
+            self._protocol.sendPing(payload)
+        except Exception as e:
+            log.debug(f'ping: {e}')
+
+    def _pong(self, payload):
+        if self._ping is not None and payload == self._ping[0]:
+            self.rtt = time.monotonic() - self._ping[1]
+            self._ping = None
 
     def _timeout(self, transaction):
         name, callback, timer = self._transactions.pop(transaction, (None, None, None))

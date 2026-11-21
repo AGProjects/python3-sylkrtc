@@ -20,7 +20,7 @@ The account, the general settings and the local cameras are those of sylk-confer
 
 The terminal takes single keys (no Enter), h or ? lists them. Waiting: c call someone,
 / a command, q quit. A call ringing in: y accept, n reject. In a call: m mute/unmute,
-s RTP statistics, i call info, x hang up, 0-9 * # DTMF, Enter to type a message to
+s RTP statistics, i call info, x e q h hang up, 0-9 the selected mixer strip's level, k the DTMF keypad, ? the keys, Enter to type a message to
 the far end, / a command. Ctrl-C hangs up; Ctrl-C again quits.
 """
 
@@ -40,7 +40,8 @@ from zope.interface import implementer
 
 from sylkrtc import sipconfig
 from sylkrtc.call import Account
-from sylkrtc.cli import AudioChoice, Console, Statistics, addresses, report_discovery, report_server_info, select_cameras, setup_logging, start_log_file
+from sylkrtc.cli import (network_lines, network_text, with_sidebar, BOLD, DIM, GAP, RED, RESET, SCALE, AudioChoice, Console, MixerControl, Statistics, StatusPanel, human_bytes,
+                         human_rate, meter_panel, vu_meters, addresses, report_discovery, report_server_info, select_cameras, setup_logging, start_log_file)
 from sylkrtc.discovery import Discovery
 from sylkrtc.rooms import RoomTarget
 from sylkrtc.videoroom import Identity
@@ -50,12 +51,14 @@ log = logging.getLogger('sylk-session')
 
 from sylkrtc.device import USER_AGENT     # one device for all the tools (sylkrtc.device)
 
-KEYS_SHORT = {'call': 'm mute, s statistics, r live RTP, a/o next microphone/speakers, d devices, i info, x hang up, 0-9*# DTMF, Enter message, / command, h or ? help'}
+REDIAL_DELAY = 5            # s: --auto-reconnect calls again this long after the far end ended the call
+
+KEYS_SHORT = {'call': 'm mute, s statistics, r live RTP, v/o next microphone/speakers, a hear the selected one, d devices, i info, x e q h hang up, 0-9 level of the selected one, k DTMF keypad, Enter message, / command, ? help'}
 KEYS_HELP = {
     'idle': '''* keys (no Enter):
     c      call someone (type user or user@domain)
     d      the audio devices (* the one used)
-    a o    the next microphone, the next speakers
+    v o    the next microphone, the next speakers
     /      type a command (/call, /quit, ...)
     q      quit
     h ?    this''',
@@ -65,21 +68,30 @@ KEYS_HELP = {
     /      type a command
     h ?    this''',
     'calling': '''* calling:
-    x      hang up
+    x e q h  hang up
     /      type a command
-    h ?    this''',
+    ?      this''',
     'call': '''* in a call, one key each:
     m      mute / unmute the microphone
     s      RTP statistics now: per stream rate, bytes, round trip time, loss; then the totals
     r      log RTP statistics and audio levels every 2 s, or stop
     d      the audio devices (* the one used)
-    a o    the next microphone, the next speakers (a configured one and the system default count too)
+    v o    the next microphone, the next speakers (a configured one and the system default count too)
+    d      the device menu (in the panel): ↑ ↓ to a device, Enter to use it (both ways for one that is both), v as
+           the microphone only, o as the speakers only; d or → closes it. ← from the mixer's
+           first strip opens it too: the arrows go from the devices to the mixer and back. Without the panel: the devices
+    ← →    select a strip of the mixer (in the panel): the microphone (with --playback the music too; the total with --total-out-level), the far end
+    ↑ ↓    its volume (1 dB a press)
+    a, space  hear the selected one of ours here too, or not: the amplifier (--monitor or --playback; headphones)
+    p      --playback: pause the music, or play it on (as m for the microphone)
+    n b    --playback: the next file of the music, the one before
     i      who, how long, muted, video codec
-    x      hang up
-    0-9*#  DTMF (SIP INFO)
+    x e q h  hang up
+    0-9    the selected one's volume: 0 off, 1 to 9 from -40 dB (barely heard) to 0 dB (full), 5 dB a step
+    k      the DTMF keypad (SIP INFO), on or off: 0-9 * # then send DTMF (not with --stereo)
     Enter  type a message to the far end (one line; t too)
     /      type a command (/hangup, /mute, /stats, /dtmf, /quit, ...)
-    h ?    this''',
+    ?      this''',
 }
 KEYS_HELP = {context: text + '\n    Ctrl-C ' + {'idle': 'quit', 'incoming': 'reject it; Ctrl-C again quits'}.get(context, 'hang up; Ctrl-C again quits')
              for context, text in KEYS_HELP.items()}
@@ -106,6 +118,22 @@ def parse_arguments():
     parser.add_argument('--audio-input', help='auto, none or a GStreamer source description')
     parser.add_argument('--audio-output', help='auto, none or a GStreamer sink description')
     parser.add_argument('--muted', action='store_true', default=None, help='start with the microphone muted')
+    parser.add_argument('--device-level', type=int, choices=range(10), default=None, metavar='0-9',
+                        help='our audio input device\'s (microphone\'s) level at first, as the keys set it: 0 muted, 1 to 9 '
+                             'from -40 dB (barely heard) to 0 dB, 5 dB a step (default 0 dB, 9)')
+    parser.add_argument('--playback-random', action='store_true',
+                        help='start the music at a random file of those given (a folder: any of its files), then on in order; '
+                             'each time we connect')
+    parser.add_argument('--playback-level', type=int, choices=range(10), default=None, metavar='0-9',
+                        help='the music\'s level at first, as the keys set it: 0 muted, 1 to 9 from -40 dB (barely heard) to 0 dB, 5 dB a step (default -6 dB)')
+    parser.add_argument('--total-out-level', action='store_true', help='with --playback: the total of what we send in the mixer too '
+                                                                       '(its level and a volume for all of it)')
+    parser.add_argument('--monitor', action='store_true', help='hear what we send in our headphones too, from the start: each of ours (the microphone, '
+                                                               'the music) on or off with a or space when selected in the mixer (with --playback alone: off at first)')
+    parser.add_argument('--playback', action='append', default=[], metavar='PATH',
+                        help='mix music into what we send (repeatable): audio files, or folders of them, played in order and again; '
+                             'with it the panel is a mixer: left and right arrows select the microphone or the music, up and down '
+                             'set its gain (in stereo with --stereo)')
     parser.add_argument('--stereo', action='store_true', help='stereo audio: a stereo microphone (or the source of --audio-input) and Opus in stereo, no echo canceller; the call is stereo when the far end asks for stereo too')
     parser.add_argument('--auto-answer', type=float, nargs='?', const=0, default=None, metavar='SECONDS',
                         help='answer incoming calls by themselves (after this many seconds, default 0)')
@@ -114,9 +142,18 @@ def parse_arguments():
                                                                   'what it supports and whether it takes the account')
     parser.add_argument('--stats-interval', type=float, default=10, metavar='SECONDS',
                         help='log the bandwidth, round trip time and loss of the call this often (default %(default)g, 0: never); a summary is logged at its end')
+    parser.add_argument('--auto-reconnect', action='store_true',
+                        help=f'a call placed from the command line: call again {REDIAL_DELAY:g} s after the far end (or the server, '
+                             'or the connection) ends it, until we hang up or quit')
     parser.add_argument('--auto-disconnect', type=float, default=0, metavar='SECONDS',
                         help='hang up this many seconds after the call is established (default %(default)g: no limit)')
     parser.add_argument('--no-input', action='store_true', help='do not read messages and commands from the terminal')
+    parser.add_argument('-j', '--jitter', action='store_true', help='show the jitter in the status panel too')
+    parser.add_argument('--jitter-buffer', type=int, default=None, metavar='MS',
+                        help='how long the jitter buffer waits for packets (default 200 ms): more for a network that delivers in bursts '
+                             '(gaps heard, late packets in the panel, but no loss), at the cost of as much delay')
+    parser.add_argument('--no-panel', action='store_true', help='no status panel at the top of the terminal (the call, audio levels, '
+                                                                'round trip time and loss), only the scrolling console')
     parser.add_argument('-v', '--verbose', '--debug', dest='debug', action='store_true', help='log debug messages')
     parser.add_argument('--sdp', action='store_true', help='log the SDP offers and answers exchanged')
     parser.add_argument('-t', '--trace', action='store_true', help='log the sylkRTC messages')
@@ -229,6 +266,9 @@ class SylkCall(object):
         self.waiting_call = None        # a second call ringing in during a call: y takes it, n rejects it
         self.switch_to = None           # the waiting call to answer once the current one is gone
         self.statistics = Statistics(arguments.stats_interval)
+        self.mixer_control = MixerControl(hidden=() if arguments.total_out_level else [('send', 'total')])      # the console mixer
+        self.panel = None           # the StatusPanel, on a terminal
+        self.registration = 'connecting'
         self._hud_timer = None
         self._hud_previous = None       # (time, bytes sent, bytes received)
         NotificationCenter().add_observer(self)
@@ -250,6 +290,8 @@ class SylkCall(object):
             reactor.stop()
             return
         self.audio = AudioChoice(self.audio_input, self.audio_output)
+        self.audio.on_switch = lambda kind: print('* ' + self.audio.apply(self.call.media if self.call is not None and self.call.state not in ('idle', 'terminated') else None, kind))
+        self.audio.watch()          # the devices that come and go, as the system tells
         print('\n'.join(f'* {line}' for line in self.audio.lines()))
         log.info(f'account {self.account_info.id} (from {os.path.join(self.config_dir, "config")})'
                  + (f', our video {self.camera[0]}' if self.camera else ', no video of ours')
@@ -282,9 +324,17 @@ class SylkCall(object):
             output = None
         elif output == 'window':
             self.window = output = RemoteVideo(f'{call.peer} - sylk-session')
-        return CallMedia(call, audio_input=self.audio.chosen['input'], audio_output=self.audio.chosen['output'],
+        media = CallMedia(call, audio_input=self.audio.chosen['input'], audio_output=self.audio.chosen['output'],
                          video_source=self.camera[1] if self.camera else None, video_output=output, ice_servers=self.server.ice_servers,
-                         video_size=self.video_size, stereo=self.stereo)
+                         video_size=self.video_size, stereo=self.stereo, playback=self.arguments.playback or None,
+                         monitor=self.arguments.monitor)
+        if self.arguments.playback_level is not None:
+            media.playback_gain = MixerControl.level_gain(self.arguments.playback_level)
+        if self.arguments.device_level is not None:
+            media.mic_gain = MixerControl.level_gain(self.arguments.device_level)
+        media.jitter_buffer = self.arguments.jitter_buffer
+        media.playback_random = self.arguments.playback_random
+        return media
 
     def place_call(self, uri):
         if self.call is not None:
@@ -309,8 +359,16 @@ class SylkCall(object):
             log.info(f'{self.arguments.auto_disconnect:g} s in the call: hanging up (--auto-disconnect)')
             self.call.hangup()
 
+    def _redial_now(self):
+        self._redial = None
+        if not self.stopping and self.call is None:
+            self.place_call(self.target)
+
     def leave(self):
         self.stopping = True
+        redial, self._redial = getattr(self, '_redial', None), None
+        if redial is not None and redial.active():
+            redial.cancel()
         busy = self.call is not None and self.call.state not in ('idle', 'terminated')
         if busy:
             self.call.hangup()
@@ -332,6 +390,7 @@ class SylkCall(object):
         if notification.sender is not self.account:
             return
         state, reason = notification.data.state, notification.data.reason
+        self.registration = {'registered': 'registered: waiting for calls', 'failed': f'registration failed: {reason}'}.get(state, state)
         if state == 'registered':
             if self.register_attempt or not getattr(self, '_announced', False):
                 print(f'* registered as {self.account.address}: waiting for calls' + (' (answered by themselves)' if self.arguments.auto_answer is not None else '')
@@ -427,8 +486,121 @@ class SylkCall(object):
                 else:
                     print(f'* {waiting.peer} is still calling, do you want to accept? (y/n)\a', flush=True)
                 return
+            if self.target and self.arguments.auto_reconnect and not call.ended_here and not self.stopping and reactor.running:
+                print(f'* calling {self.target} again in {REDIAL_DELAY:g} s (--auto-reconnect; Ctrl-C or q to stop)')
+                self._redial = reactor.callLater(REDIAL_DELAY, self._redial_now)
+                return
             if self.target and not self.stopping and reactor.running:
                 reactor.stop()          # a call placed from the command line: done
+
+    # The status panel: the top 65% of the terminal, the console scrolling under it
+
+    PANEL_FRACTION = 0.65
+    SIDEBAR_WIDTH = 44       # the list of the audio devices, on the left of the panel
+
+    def start_panel(self):
+        if self.arguments.discover or self.arguments.server_info:
+            return      # a report: printed as it is
+        self.panel = StatusPanel(fraction=self.PANEL_FRACTION)
+        if not self.panel.start():
+            self.panel = None
+            return
+        self.panel.on_resize = lambda: self.panel.update(self._panel_lines())
+        from sylkrtc.util import RepeatingTimer
+        self._panel_timer = RepeatingTimer(Statistics.TICK, self._update_panel)
+        self._panel_timer.start(0)
+        reactor.addSystemEventTrigger('after', 'shutdown', self.panel.stop)
+
+    def _update_panel(self):
+        try:
+            self.panel.update(self._panel_lines())
+        except Exception as e:
+            log.debug(f'status panel: {e}')
+
+    def _panel_lines(self):
+        """Our microphone on the left (a meter per channel), the far end on the right (one, or L and R when it sends
+        stereo), loss, round trip time and jitter between them; what goes out and comes in under them."""
+        audio = getattr(self, 'audio', None)
+        mic = audio.current('input') if audio is not None else '-'
+        speakers = audio.current('output') if audio is not None else '-'
+        footer = DIM + ('── ? help · m mute · r live RTP log · v/o microphone/speakers · d devices · x e q h hang up ' if self.call is not None and self.call.state not in ('idle', 'terminated') else '── h ? help · c call · v/o microphone/speakers · d devices · q quit ') + '─' * 400 + RESET
+        call = self.call
+        rows = {}
+        for row in self.statistics.current:
+            rows.setdefault(row['direction'], row)
+        out, incoming = rows.get('out'), rows.get('in')
+        channels = 2 if self.stereo else 1
+        if call is None or call.state in ('idle', 'terminated'):
+            title = f'{BOLD} sylk-session{RESET}  {self.account_info.id}  {DIM}{self.registration}{RESET}'
+            peer = 'remote'
+        else:
+            title = f'{BOLD} {call.peer}{RESET}  {call.state}'
+            if call.state == 'established' and getattr(self, 'established_at', None):
+                seconds = int(reactor.seconds() - self.established_at)
+                title += f' {seconds // 3600}:{seconds // 60 % 60:02d}:{seconds % 60:02d}' if seconds >= 3600 else f' {seconds // 60}:{seconds % 60:02d}'
+            title += f'  {DIM}opus {"stereo" if self.stereo else "mono"}'
+            codec = getattr(call.media, 'video_codec', None) if call.media is not None else None
+            title += (f', video {codec}' if codec else '') + RESET
+            if call.audio_muted:
+                title += f'  {RED}{BOLD}MUTED{RESET}'
+            if getattr(self, 'keypad', False):
+                title += f'  {BOLD}DTMF KEYPAD{RESET}'
+            peer = call.peer.partition('@')[0]
+
+        def value(row, name):
+            return row[name] if row is not None else None
+
+        def percent(fraction):
+            return None if fraction is None else 100.0 * fraction
+
+        def milliseconds(seconds):
+            return None if seconds is None else 1000.0 * seconds
+
+        loss_out, loss_in = percent(value(out, 'loss_held')), percent(value(incoming, 'loss_held'))     # the worst of 10 s
+        rtt = milliseconds(value(out, 'rtt'))
+        jitter_out, jitter_in = milliseconds(value(out, 'jitter')), milliseconds(value(incoming, 'jitter'))
+        muted = call is not None and call.audio_muted
+        # the network on the left (over the devices), the levels here
+        # as wide as the column: its width less the name (9), a space and the value (up to 8), and its rule (2)
+        late_in = percent(value(incoming, 'late_held'))
+        totals = dict(lost_out=value(out, 'lost_total'), lost_in=value(incoming, 'lost_total'), late_in=value(incoming, 'late_total'))
+        connection = getattr(call, 'connection', None) if call is not None else None
+        server_rtt = connection.rtt * 1000 if connection is not None and getattr(connection, 'rtt', None) is not None else None
+        network = network_lines(rtt, loss_out, loss_in, jitter_out, jitter_in, jitter=self.arguments.jitter, width=self.SIDEBAR_WIDTH - 26,
+                                late_in=late_in, totals=totals, server_rtt=server_rtt)
+        groups = [SCALE]
+        # ours: the microphone (with --playback: the microphone, the music, then the total, all we send); then the far end
+        media = call.media if call is not None and call.state not in ('idle', 'terminated') else None
+        mixer = getattr(media, 'send_mixer', None)
+        control = self.mixer_control
+        control.elsewhere = getattr(self, 'audio', None) is not None and self.audio.menu
+        if mixer is not None:
+            for strip in mixer.strips:
+                if strip['name'] == 'total' and not self.arguments.total_out_level:
+                    continue        # the total (what is sent) only with --total-out-level
+                level = value(out, 'level') if strip['name'] == 'total' else self.statistics.strip_levels.get(strip['name'])
+                label, style = control.label(media, 'send', strip['name'], strip['name'], muted=strip['name'] == 'mic' and muted)
+                groups.append((label, vu_meters(level, channels), style))
+        else:
+            label, style = control.label(media, 'send', 'mic', 'mic', muted=muted)
+            groups.append((label, vu_meters(value(out, 'level'), channels), style))
+        label, style = control.label(media, 'listen', 'remote', peer[:12])
+        groups += [GAP, (label, vu_meters(value(incoming, 'level'), channels), style)]
+        if media is not None:
+            footer = DIM + '── ← → select · ↑ ↓ volume' + (' · p pause · n b next/back' if mixer is not None else '') + ' · 0-9 level · a/space hear it' + ('' if self.stereo else ' · k keypad') + ' · ? help · m mute · x e q h hang up ' + '─' * 400 + RESET
+
+        def traffic(row):
+            if row is None or row['rate'] is None:
+                return '-'
+            return f'{human_rate(row["rate"])} {row["pps"]:.0f} pkt/s {human_bytes(row["bytes"])}'
+        info = [f' {BOLD}out{RESET} {traffic(out)}    {BOLD}in{RESET} {traffic(incoming)}',
+                f' {DIM}microphone{RESET} {mic}    {DIM}speakers{RESET} {speakers}']
+        if mixer is not None and MixerControl.info(mixer):
+            info.append(MixerControl.info(mixer))
+        if getattr(self, 'audio', None) is not None and self.panel.columns >= self.SIDEBAR_WIDTH + 60:
+            lines = meter_panel(self.panel.height, self.panel.columns - self.SIDEBAR_WIDTH, title, groups, info, footer)
+            return with_sidebar(lines, network + [''] + self.audio.sidebar(), self.SIDEBAR_WIDTH)
+        return meter_panel(self.panel.height, self.panel.columns, title, groups, [network_text(rtt, loss_out, loss_in)] + info, footer)
 
     def _update_hud(self):
         """Every second: hang up when the video window was closed; the window's overlay (bandwidth, round trip
@@ -508,15 +680,32 @@ class SylkCall(object):
 
     def key(self, key):
         """One key typed. True when a line is typed next (a message, a command, who to call)."""
+        try:
+            return self._key(key)
+        except Exception:
+            log.exception(f'the key {key!r}')        # else lost: Twisted's own log is not shown
+            return False
+
+    def _key(self, key):
         context = self.keys_context()
         call = self.call
-        if key in ('?', 'h'):
+        if key == '?' or (key == 'h' and context not in ('call', 'calling')):     # in a call h hangs up
             print(KEYS_HELP[context])
             if self.waiting_call is not None:
                 print(f'* {self.waiting_call.peer} is calling too:\n'
                       f'    y      accept it, hanging up the call with {call.peer}\n'
                       f'    n      reject it')
             return False
+        audio = getattr(self, 'audio', None)
+        if audio is not None and audio.menu:
+            kinds = audio.menu_key(key)
+            if kinds is not None:
+                media = call.media if call is not None and call.state not in ('idle', 'terminated') else None
+                for kind in kinds:
+                    print('* ' + audio.apply(media, kind))
+                if self.panel is not None:
+                    self._update_panel()
+                return False
         waiting = self.waiting_call
         if waiting is not None and key in 'yYnN':
             if key in 'yY':
@@ -528,13 +717,28 @@ class SylkCall(object):
                 self.waiting_call = None
                 waiting.reject()
             return False
-        if key in 'dao' and key and hasattr(self, 'audio'):
-            if key == 'd':
+        if key in 'dvo' and key and hasattr(self, 'audio'):
+            if key == 'd' and self.panel is not None:
+                self.audio.open_menu()          # in the panel: ↑ ↓ to a device, Enter (or v, o) to use it
+                self._update_panel()
+            elif key == 'd':
                 print('\n'.join(f'* {line}' for line in self.audio.lines()))
             else:
-                kind = 'input' if key == 'a' else 'output'
+                kind = 'input' if key == 'v' else 'output'
                 self.audio.select(kind)
                 print('* ' + self.audio.apply(call.media if call is not None and call.state not in ('idle', 'terminated') else None, kind))
+            return False
+        if key == 'left' and audio is not None and self.panel is not None and self.mixer_control.at_first(call.media if call is not None else None):
+            audio.open_menu()           # ← from the first strip of the mixer: the device menu, on its left
+            self._update_panel()
+            return False
+        if key in MixerControl.KEYS:
+            if call is not None and call.media is not None and self.mixer_control.key(call.media, key):
+                if self.panel is not None:
+                    self._update_panel()
+                else:
+                    strip = self.mixer_control.selected_strip(call.media)
+                    print(f'* {strip["name"]}: {strip["gain"]:+.0f} dB')
             return False
         if key == '/':
             self.line_purpose = 'command'
@@ -560,7 +764,7 @@ class SylkCall(object):
                 call.reject()
             return False
         elif context == 'calling':
-            if key == 'x':
+            if key in 'xeqh':
                 print(f'* hanging up the call to {call.peer}')
                 call.hangup()
         elif context == 'call':
@@ -581,12 +785,34 @@ class SylkCall(object):
                 codec = getattr(call.media, 'video_codec', None) if call.media is not None else None
                 print(f'* in a call with {call.peer} for {seconds // 60}:{seconds % 60:02d}'
                       + (', microphone muted' if call.audio_muted else '') + (f', video {codec}' if codec else ''))
-            elif key == 'x':
+            elif key in ('a', ' ') and call.media is not None:
+                print('* ' + self.mixer_control.toggle_monitor(call.media))
+                if self.panel is not None:
+                    self._update_panel()
+            elif key == 'p' and getattr(call.media, 'send_mixer', None) is not None:
+                print('* music paused' if call.media.send_mixer.toggle_pause() else '* music on')
+            elif key in ('n', 'b') and getattr(call.media, 'send_mixer', None) is not None:
+                call.media.send_mixer.next() if key == 'n' else call.media.send_mixer.previous()
+            elif key in 'xeqh':
                 print(f'* hanging up the call with {call.peer}')
                 call.hangup()
-            elif key in '0123456789*#':
+            elif key == 'k' and self.stereo:
+                print('* no DTMF in a stereo call (--stereo): it is for regular calls')
+            elif key == 'k':
+                self.keypad = not getattr(self, 'keypad', False)
+                print('* DTMF keypad: 0-9 * # send DTMF (k again: the digits set levels)' if self.keypad else '* DTMF keypad off: the digits set levels')
+            elif key in '0123456789*#' and not self.stereo and (getattr(self, 'keypad', False) or key in '*#'):
                 if call.send_dtmf(key):
                     print(f'* DTMF {key}')
+            elif key in '0123456789':
+                strip = self.mixer_control.set_level(call.media, int(key)) if call.media is not None else None
+                if strip is None:
+                    print('* no mixer strip to set (no media yet)')
+                else:
+                    from sylkrtc.gst import GAIN_FLOOR
+                    print(f'* {strip["name"]}: ' + ('off' if strip['gain'] <= GAIN_FLOOR else f'{strip["gain"]:+.1f} dB'))
+                    if self.panel is not None:
+                        self._update_panel()
         return False
 
     def resume_keys(self):
@@ -674,6 +900,8 @@ class SylkCall(object):
                     print('* not in a call')
                 else:
                     self.statistics.log()
+            elif command == 'dtmf' and self.stereo:
+                print('* no DTMF in a stereo call (--stereo): it is for regular calls')
             elif command == 'dtmf' and call is not None and rest:
                 if not call.send_dtmf(rest.replace(' ', '')):
                     print('* not in a call')
@@ -698,6 +926,8 @@ def main():
         stdio.StandardIO(client.console)
         reactor.callWhenRunning(client.resume_keys)
     reactor.addSystemEventTrigger('before', 'shutdown', client.leave)     # SIGTERM (and the second Ctrl-C) stop the reactor
+    if not arguments.no_panel:
+        reactor.callWhenRunning(client.start_panel)
 
     def install_sigint():
         # after the reactor's own handlers: Ctrl-C hangs up first, quits the second time

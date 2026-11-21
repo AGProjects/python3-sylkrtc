@@ -6,6 +6,7 @@ the console and its log file, and the reports (--discover, --server-info)."""
 
 import logging
 import os
+import re
 import sys
 import time
 
@@ -176,6 +177,160 @@ class AudioChoice(object):
     def __init__(self, audio_input, audio_output):
         self.configured = {'input': audio_input or 'auto', 'output': audio_output or 'auto'}
         self.chosen = dict(self.configured)
+        self._devices = None        # (time, inputs, outputs), for the panel
+        self.on_switch = None       # on_switch(kind): the device of kind chosen anew (one plugged in, or gone)
+        self.menu = False           # the device menu (d, in the panel) is open: the arrows move in it
+        self.cursor = 0
+
+    def watch(self):
+        """The devices looked up again when the system says they changed (not polled): whether it can say."""
+        from sylkrtc.gst import watch_audio_devices
+        return watch_audio_devices(lambda: reactor.callFromThread(self._changed))
+
+    def _changed(self):
+        before = self._devices
+        inputs, outputs = self.devices(refresh=True)
+        if before is None:
+            return
+        old = {('input', device.name) for device in before[1]} | {('output', device.name) for device in before[2]}
+        new = {('input', device.name) for device in inputs} | {('output', device.name) for device in outputs}
+        for kind, name in sorted(new - old):
+            log.info(f'audio device added: {name} ({kind})')
+        for kind, name in sorted(old - new):
+            log.info(f'audio device removed: {name} ({kind})')
+        # one plugged in: used (a headset, both ways); the one used gone: back to the configured one
+        for kind, devices in (('input', inputs), ('output', outputs)):
+            added = [device for device in devices if (kind, device.name) in new - old]
+            chosen = self.chosen[kind]
+            if added:
+                self.chosen[kind] = added[-1]
+            elif not isinstance(chosen, str) and (kind, chosen.name) in old - new:
+                self.chosen[kind] = self.configured[kind]
+            else:
+                continue
+            if self.on_switch is not None:
+                self.on_switch(kind)
+
+    def devices(self, refresh=False):
+        """(inputs, outputs): the AudioDevices, as last looked up (again when refresh: on d, v, o and when the system
+        says they changed, see watch)."""
+        if refresh or self._devices is None:
+            from sylkrtc.gst import audio_devices
+            inputs, outputs = audio_devices()
+            self._devices = (time.monotonic(), inputs, outputs)
+        return self._devices[1], self._devices[2]
+
+    def _used(self, kind, device):
+        chosen = self.chosen[kind]
+        if isinstance(chosen, str):
+            return chosen in ('', 'auto') and device.default        # auto: the system's default one
+        return chosen.name == device.name
+
+    # macOS names the halves of one device apart: the built-in microphone goes with the built-in speakers, or with
+    # the headphones plugged in ('External Headphones'); 'X Microphone' with 'X Speakers'
+    _SUFFIX = re.compile(r'^(.*?)\s+(Microphone|Mic|Speakers|Speaker|Headphones|Headset|Input|Output)$', re.I)
+    _BUILT_IN = re.compile(r'^(MacBook( Pro| Air)?|iMac( Pro)?|Mac mini|Mac Studio|Mac Pro)\b')
+    _EXTERNAL = ('External Headphones', 'External Microphone', 'Headphones', 'Line In', 'Line Out')
+
+    @staticmethod
+    def _short(part):
+        """'Microphone' mic, 'External Headphones' headphones, 'Speakers' speakers."""
+        part = part.replace('External ', '').lower()
+        return {'microphone': 'mic', '': 'mic'}.get(part, part)
+
+    @classmethod
+    def _base(cls, name):
+        match = cls._SUFFIX.match(name)
+        return match.group(1) if match else name
+
+    def _groups(self):
+        """[(base name, [inputs], [outputs])]: the devices that are halves of one (see above) together, in order."""
+        inputs, outputs = self.devices()
+        names = [device.name for device in inputs + outputs]
+        built_in = next((self._base(name) for name in names if self._BUILT_IN.match(self._base(name))), 'Built-in')
+        groups = {}
+        for kind, devices in (('input', inputs), ('output', outputs)):
+            for device in devices:
+                base = built_in if device.name in self._EXTERNAL else self._base(device.name)
+                groups.setdefault(base, ([], []))[0 if kind == 'input' else 1].append(device)
+        return [(base, ins, outs) for base, (ins, outs) in groups.items()]
+
+    def _sections(self):
+        """[(title, [(label, input AudioDevice or None, output AudioDevice or None)])]: each device once, those that
+        are both an input and an output (one device, or the halves of one) first, then the inputs, then the outputs."""
+        both, only_in, only_out = [], [], []
+        for base, ins, outs in self._groups():
+            if ins and outs:
+                pairs = [(ins[0], output) for output in outs] + [(input, outs[0]) for input in ins[1:]]
+                for input, output in pairs:
+                    if input.name == output.name:
+                        label = input.name
+                    else:
+                        parts = [self._short(name[len(base):].strip() if name.startswith(base) else name) for name in (input.name, output.name)]
+                        label = f'{base} {DIM}({parts[0]} + {parts[1]}){RESET}'
+                    both.append((label, input, output))
+            else:
+                only_in += [(device.name, device, None) for device in ins]
+                only_out += [(device.name, None, device) for device in outs]
+        return [(title, items) for title, items in (('Combined devices', both), ('Input devices', only_in), ('Output devices', only_out)) if items]
+
+    def _menu_items(self):
+        return [item for title, items in self._sections() for item in items]
+
+    def open_menu(self):
+        """d: the device menu, at the microphone used."""
+        items = self._menu_items()
+        self.menu = bool(items)
+        self.cursor = next((index for index, (name, input, output) in enumerate(items) if input is not None and self._used('input', input)), 0)
+
+    def menu_key(self, key):
+        """A key while the device menu is open: the kinds ('input', 'output') of the device chosen with it ([]: none),
+        or None for a key the menu does not take (it closes: the key does what it does elsewhere)."""
+        items = self._menu_items()
+        if not items:
+            self.menu = False
+            return None
+        self.cursor %= len(items)
+        if key in ('up', 'down'):
+            self.cursor = (self.cursor + (1 if key == 'down' else -1)) % len(items)
+            return []
+        if key in ('\n', 'v', 'o'):
+            name, input, output = items[self.cursor]
+            kinds = []
+            if key in ('\n', 'v') and input is not None:
+                self.chosen['input'] = input
+                kinds.append('input')
+            if key in ('\n', 'o') and output is not None:
+                self.chosen['output'] = output
+                kinds.append('output')
+            if key == '\n':
+                self.menu = False
+            return kinds
+        if key == 'left':
+            return []               # the menu is the leftmost: ← stays in it
+        self.menu = False
+        return [] if key in ('d', 'right', '\x1b') else None     # → back to the mixer
+
+    def sidebar(self):
+        """The panel's list of the devices (see _sections); IN for the microphone used, OUT for the speakers (in, out
+        dim: what else each can be); the device menu's cursor, reversed, when it is open."""
+        hint = f'{DIM}↑↓ Enter v o · → back{RESET}' if self.menu else f'{DIM}← or d: choose{RESET}'
+        lines = []
+
+        def mark(kind, device):
+            # IN / OUT (green): the input / output used; in / out (dim): one it can be; blank: one it cannot
+            word = 'in ' if kind == 'input' else 'out'
+            return '   ' if device is None else GREEN + BOLD + word.upper() + RESET if self._used(kind, device) else DIM + word + RESET
+        index = 0
+        for title, items in self._sections():
+            lines.append(BOLD + title + RESET + ('  ' + hint if not lines else ''))     # the keys on the first title
+            for name, input, output in items:
+                label = name
+                if self.menu and index == self.cursor:
+                    label = REVERSE + BOLD + _ESCAPE.sub('', name) + RESET
+                lines.append(f' {mark("input", input)} {mark("output", output)}  {label}')
+                index += 1
+        return lines
 
     @staticmethod
     def describe(option):
@@ -184,8 +339,7 @@ class AudioChoice(object):
         return option.name + (' (system default)' if option.default else '')
 
     def options(self, kind):
-        from sylkrtc.gst import audio_devices
-        inputs, outputs = audio_devices()
+        inputs, outputs = self.devices(refresh=True)
         return [self.configured[kind]] + (inputs if kind == 'input' else outputs)
 
     def _index(self, options, kind):
@@ -247,7 +401,7 @@ def loss(lost, total):
 
 def meter(level, width=20, floor=-60.0):
     """(RMS dBFS, peak dBFS) as a bar from floor to 0 dBFS (= RMS, | peak) and the numbers."""
-    rms, peak = level
+    rms, peak = level[0], level[1]
     if peak <= -99:
         return 'silent'
     filled = int(round(width * min(1.0, max(0.0, (rms - floor) / -floor))))
@@ -258,12 +412,486 @@ def meter(level, width=20, floor=-60.0):
     return f'[{"".join(bar)}] rms {rms:.0f} peak {peak:.0f} dBFS'
 
 
+# The status panel
+
+GREEN, YELLOW, RED, DIM, BOLD, RESET = '\x1b[32m', '\x1b[33m', '\x1b[31m', '\x1b[2m', '\x1b[1m', '\x1b[0m'
+REVERSE, CYAN = '\x1b[7m', '\x1b[36m'
+
+
+def vu(level, width=24, floor=-60.0):
+    """A coloured VU meter of (RMS dBFS, peak dBFS): green to -18 dBFS, yellow to -6, red above; | the peak."""
+    if level is None:
+        return DIM + '·' * width + RESET
+    rms, peak = level[0], level[1]
+    cells = []
+    mark = int(width * min(1.0, max(0.0, (peak - floor) / -floor))) if peak > floor else -1
+    for index in range(width):
+        top = floor + (index + 1) * -floor / width       # the dBFS this cell stands for
+        colour = GREEN if top <= -18 else YELLOW if top <= -6 else RED
+        if index == min(mark, width - 1):
+            cells.append(colour + BOLD + '|' + RESET)
+        elif rms >= top - -floor / width:
+            cells.append(colour + '█' + RESET)
+        else:
+            cells.append(DIM + '·' + RESET)
+    return ''.join(cells)
+
+
+def gauge(value, full, warn, bad, width=10):
+    """A coloured bar of value out of full: green, yellow from warn, red from bad; dim dots when unknown."""
+    if value is None:
+        return DIM + '·' * width + RESET
+    filled = min(width, int(round(width * min(1.0, max(0.0, value / full)))))
+    colour = RED if value >= bad else YELLOW if value >= warn else GREEN
+    return colour + '█' * filled + RESET + DIM + '·' * (width - filled) + RESET
+
+
+_ESCAPE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+
+
+def fit(text, columns):
+    """text (with colour escapes) cut to columns visible characters."""
+    out, visible, position = [], 0, 0
+    for match in _ESCAPE.finditer(text):
+        plain = text[position:match.start()]
+        if visible + len(plain) > columns:
+            out.append(plain[:columns - visible])
+            return ''.join(out) + RESET
+        out.append(plain)
+        visible += len(plain)
+        out.append(match.group(0))
+        position = match.end()
+    plain = text[position:]
+    out.append(plain[:max(0, columns - visible)])
+    return ''.join(out) + RESET
+
+
+# Vertical meters: groups of columns side by side, each a bar from the bottom (eighth blocks at its top)
+
+EIGHTHS = ' ▁▂▃▄▅▆▇'
+VU_FLOOR = -60.0
+SLOT = 5                    # a column's width: its bar (3) and the space after it
+SPACER = None               # in the groups of meter_panel: the room left, shared between the spacers
+GAP = 'gap'                 # in the groups: a few columns of space
+SCALE = 'scale'             # in the groups: the dBFS scale of the VU meters that follow
+
+
+def _column(fraction, height, colour, peak=None, width=3):
+    """The rows of a vertical bar, top first: fraction (0-1) of it filled, colour(position 0-1) of each row, a line at
+    peak (0-1); a dim track for what is not filled (all of it when fraction is None: not known)."""
+    filled = None if fraction is None else min(1.0, max(0.0, fraction)) * height
+    peak_row = None if not peak or peak <= 0 else min(height - 1, int(min(1.0, peak) * height - 1e-9))
+    rows = []
+    for top in range(height):
+        index = height - 1 - top
+        code = colour((index + 0.5) / height)
+        part = int((filled - index) * 8) if filled is not None and index < filled < index + 1 else 0
+        if filled is not None and filled >= index + 1:
+            rows.append(code + '█' * width + RESET)
+        elif part:
+            rows.append(code + EIGHTHS[part] * width + RESET)
+        elif index == peak_row:
+            rows.append(code + BOLD + '━' * width + RESET)
+        else:
+            rows.append(DIM + '░' * width + RESET)
+    return rows
+
+
+def _vu_fraction(decibels):
+    return min(1.0, max(0.0, (decibels - VU_FLOOR) / -VU_FLOOR))
+
+
+def _vu_colour(position):
+    decibels = VU_FLOOR + position * -VU_FLOOR
+    return GREEN if decibels <= -18 else YELLOW if decibels <= -6 else RED
+
+
+def vu_meters(level, channels=1):
+    """The meters of a level of media.levels() ((RMS, peak, [(RMS, peak) per channel]) dBFS): one per channel (L and
+    R for two); channels of them, unlit, when the level is None."""
+    if level is None:
+        return [('vu', None, '')] * channels
+    per_channel = level[2] if len(level) > 2 and level[2] else [(level[0], level[1])]
+    names = ['L', 'R'] if len(per_channel) == 2 else [''] * len(per_channel)
+    return [('vu', value, name) for value, name in zip(per_channel, names)]
+
+
+def gauge_meter(value, full, warn, bad, text):
+    """A meter of value out of full (green, yellow from warn, red from bad), text under it."""
+    return ('gauge', value, full, warn, bad, text)
+
+
+def _cells(meter, height):
+    if meter[0] == 'vu':
+        value, name = meter[1], meter[2]
+        if value is None:
+            return _column(None, height, _vu_colour), '-'
+        rms, peak = value
+        text = (name + (f'{rms:.0f}' if peak > -99 else 'off')).strip()
+        return _column(_vu_fraction(rms), height, _vu_colour, peak=_vu_fraction(peak) if peak > VU_FLOOR else None), text
+    value, full, warn, bad, text = meter[1:]
+    return _column(None if value is None else value / full, height,
+                   lambda position: RED if position * full >= bad else YELLOW if position * full >= warn else GREEN), text
+
+
+def _center(text, width):
+    text = text[:width]
+    left = (width - len(text)) // 2
+    return ' ' * left + text + ' ' * (width - len(text) - left)
+
+
+def meter_panel(height, width, title, groups, info=(), footer=''):
+    """The lines of a status panel height lines high: the title, the groups of vertical meters side by side, left
+    aligned (a group: (name, [meters]) of vu_meters and gauge_meter, or (name, [meters], style): style True for the
+    selected one (reversed), 'muted' for a muted one (in red), the same width either way; GAP: some space; SCALE: the dBFS scale;
+    SPACER: the room left, shared between the spacers), the groups' names and every meter's value under them, the
+    info lines, the footer."""
+    info = list(info)
+    rows = height - 4 - len(info)
+    while rows < 4 and info:
+        info.pop()
+        rows += 1
+    rows = max(2, rows)
+    marks = {}
+    for decibels in (0, -6, -18, -30, -45):
+        row = int(round((1 - _vu_fraction(decibels)) * (rows - 1)))
+        marks.setdefault(row, f'{decibels:>3} ' + DIM + '┤' + RESET)
+    built, fixed, spacers = [], 1, 0
+    for group in groups:
+        if group is SPACER:
+            built.append(('spacer',))
+            spacers += 1
+        elif group == GAP:
+            built.append(('space', 4))
+            fixed += 4
+        elif group == SCALE:
+            built.append(('scale',))
+            fixed += 5
+        else:
+            name, meters = group[0], group[1]
+            columns = [_cells(meter, rows) for meter in meters]
+            group_width = max(len(name) + 2, SLOT * len(columns) + 1)
+            built.append(('group', name, columns, group_width, len(group) > 2 and group[2]))
+            fixed += group_width
+    room = max(0, width - 1 - fixed)
+    shares = [room // spacers + (1 if index < room % spacers else 0) for index in range(spacers)] if spacers else []
+
+    def line(part):
+        text, spacer = ' ', 0
+        for entry in built:
+            if entry[0] == 'spacer':
+                text += ' ' * shares[spacer]
+                spacer += 1
+            elif entry[0] == 'space':
+                text += ' ' * entry[1]
+            elif entry[0] == 'scale':
+                text += part('scale', None)
+            else:
+                text += part('group', entry)
+        return text
+
+    def meter_row(row):
+        def part(kind, entry):
+            if kind == 'scale':
+                return marks.get(row, '    ' + DIM + '│' + RESET)
+            name, columns, group_width = entry[1:4]
+            return ' ' + ''.join(cells[row] + ' ' * (SLOT - 3) for cells, text in columns) + ' ' * (group_width - 1 - SLOT * len(columns))
+        return line(part)
+
+    def name_part(kind, entry):
+        if kind == 'scale':
+            return ' ' * 5
+        name, columns, group_width, style = entry[1:]
+        if style == 'muted':        # in red, the same width: nothing moves
+            return RED + BOLD + _center(name, group_width) + RESET
+        if style:
+            label = _center(name, group_width - 1)
+            return REVERSE + BOLD + label + RESET + ' '
+        return BOLD + _center(name, group_width) + RESET
+
+    def value_part(kind, entry):
+        if kind == 'scale':
+            return ' ' * 5
+        name, columns, group_width = entry[1:4]
+        return ' ' + ''.join(_center(text, SLOT - 1) + ' ' for cells, text in columns) + ' ' * (group_width - 1 - SLOT * len(columns))
+
+    return [title] + [meter_row(row) for row in range(rows)] + [line(name_part), line(value_part)] + info + [footer]
+
+
+class MixerControl(object):
+    """The console mixer of a media (its mixer_strips(): what we send, then what we hear): left and right select a
+    strip, up and down change its gain by STEP dB. The gains are kept for the next call (or connection to the room),
+    and for what is heard from a participant that joins later."""
+
+    STEP = 1.0
+    KEYS = ('left', 'right', 'up', 'down')
+
+    def __init__(self, hidden=()):
+        self.selected = 0
+        self.gains = {}             # (kind, key) -> gain, as last set
+        self.hidden = set(hidden)   # (kind, key) of strips not shown, nor selected (('send', 'total') by default)
+        self.monitors = {}          # strip key -> whether we hear it here, as last set
+        self.elsewhere = False      # the arrows are in the device menu: no strip shown selected
+        self._media = None
+
+    def strips(self, media):
+        if media is None or not hasattr(media, 'mixer_strips'):
+            return []
+        if media is not self._media:
+            self._media = media
+            for (kind, key), gain in self.gains.items():
+                media.set_strip_gain(kind, key, gain)
+            for key, on in self.monitors.items():
+                if hasattr(media, 'set_strip_monitor'):
+                    media.set_strip_monitor(key, on)
+        return [strip for strip in media.mixer_strips() if (strip['kind'], strip['key']) not in self.hidden]
+
+    def at_first(self, media):
+        """Whether ← now leaves the mixer (for the device menu, on its left): at its first strip, or no mixer."""
+        strips = self.strips(media)
+        return not strips or self.selected % len(strips) == 0
+
+    def key(self, media, key):
+        """A key for the mixer: whether it took it."""
+        strips = self.strips(media)
+        if not strips or key not in self.KEYS:
+            return False
+        self.selected %= len(strips)
+        if key in ('left', 'right'):
+            self.selected = (self.selected + (1 if key == 'right' else -1)) % len(strips)
+            return True
+        from sylkrtc.gst import GAIN_FLOOR
+        strip = strips[self.selected]
+        gain = strip['gain']
+        if key == 'up' and gain <= GAIN_FLOOR:
+            gain = -40.0 - self.STEP        # from off, straight to something (barely) heard
+        media.set_strip_gain(strip['kind'], strip['key'], gain + (self.STEP if key == 'up' else -self.STEP))
+        for each in media.mixer_strips():
+            if (each['kind'], each['key']) == (strip['kind'], strip['key']):
+                self.gains[(strip['kind'], strip['key'])] = each['gain']
+        return True
+
+    @staticmethod
+    def level_gain(digit):
+        """A digit's gain, as a fader's: 0 off, 1 to 9 from -40 dB (barely heard) to 0 dB (unity), 5 dB a step (even
+        steps of loudness, as one hears it)."""
+        from sylkrtc.gst import GAIN_FLOOR
+        if digit == 0:
+            return GAIN_FLOOR
+        return -40.0 + (digit - 1) * 5.0
+
+    @staticmethod
+    def level_digit(gain):
+        """The key (0-9) of a gain: the nearest step, 9+ above unity, 0 off."""
+        from sylkrtc.gst import GAIN_FLOOR
+        if gain <= GAIN_FLOOR:
+            return '0'
+        if gain > 0.5:
+            return '9+'
+        return str(min(9, max(1, int(round((gain + 40.0) / 5.0)) + 1)))
+
+    def set_level(self, media, digit):
+        """0-9 for the selected strip (see level_gain): the strip, None when there is none."""
+        strip = self.selected_strip(media)
+        if strip is None:
+            return None
+        media.set_strip_gain(strip['kind'], strip['key'], self.level_gain(digit))
+        for each in media.mixer_strips():
+            if (each['kind'], each['key']) == (strip['kind'], strip['key']):
+                self.gains[(strip['kind'], strip['key'])] = each['gain']
+                return each
+        return strip
+
+    def toggle_monitor(self, media):
+        """l: hear the selected strip here too, or not: a message to show."""
+        strip = self.selected_strip(media)
+        if strip is None or strip['kind'] != 'send':
+            return 'select one of ours (the microphone, the music) to hear it here'
+        if strip['monitor'] is None:
+            return 'to hear ourselves here start with --monitor (or --playback), and use headphones'
+        on = not strip['monitor']
+        media.set_strip_monitor(strip['key'], on)
+        self.monitors[strip['key']] = on
+        return f'{strip["name"]}: ' + ('heard here too (headphones: from speakers the microphone takes it in again)' if on else 'not heard here')
+
+    def selected_strip(self, media):
+        strips = self.strips(media)
+        return strips[self.selected % len(strips)] if strips else None
+
+    def label(self, media, kind, key, name, muted=False):
+        """(name and gain, the same width whatever the gain; style for meter_panel: True selected, 'muted', False)."""
+        from sylkrtc.gst import GAIN_FLOOR
+        strips = self.strips(media)
+        for index, strip in enumerate(strips):
+            if (strip['kind'], strip['key']) == (kind, key):
+                gain = strip['gain']
+                text = f'{self.level_digit(gain):>2} ' + ('off' if gain <= GAIN_FLOOR else f'{gain:+.0f}dB').rjust(5)     # the key, the dB
+                selected = index == self.selected % len(strips) and not self.elsewhere
+                if strip.get('monitor') is not None:
+                    name = ('● ' if strip['monitor'] else '○ ') + name     # heard here too, or not
+                return f'{name} {text}', True if selected else 'muted' if muted else False
+        return name, 'muted' if muted else False
+
+    @staticmethod
+    def info(mixer):
+        if mixer is None or mixer.title is None:
+            return None
+        return (f' {CYAN}♪{RESET} {mixer.title} {DIM}({mixer.track + 1} of {len(mixer.files)}){RESET}'
+                + (f'  {YELLOW}{BOLD}PAUSED{RESET}' if getattr(mixer, 'paused', False) else ''))
+
+
+def network_lines(rtt, loss_out, loss_in, jitter_out=None, jitter_in=None, jitter=False, width=12, late_in=None, totals=None,
+                  server_rtt=None):
+    """The panel's lines of the network (on the left, over the devices): round trip time (ms), loss (%) of what we
+    send (the far end's report) and of what we get, the packets that came too late for the jitter buffer (%: heard
+    as gaps, not loss) - those the worst of the last Statistics.HOLD s, and totals ({name: packets since the start})
+    after them -, and with jitter the jitter (ms) both ways, each a bar."""
+    totals = totals or {}
+
+    def line(name, value, full, warn, bad, text, key=None):
+        total = totals.get(key) if key else None
+        return (f'{name:<9}{gauge(value, full, warn, bad, width)} ' + ('-' if value is None else text)
+                + (f' {DIM}{total}{RESET}' if total else ''))
+    lines = [f'{BOLD}network{RESET}  {DIM}worst of {Statistics.HOLD} s · packets in all{RESET}',
+             # the far end's, from its RTCP reports; when they have none, the server's (a WebSocket ping)
+             line('rtt', rtt, 500, 150, 300, f'{rtt:.0f} ms' if rtt is not None else '') if rtt is not None or server_rtt is None else
+             line('rtt srv', server_rtt, 500, 150, 300, f'{server_rtt:.0f} ms'),
+             line('loss ↑', loss_out, 10, 1, 5, f'{loss_out:.1f}%' if loss_out is not None else '', 'lost_out'),
+             line('loss ↓', loss_in, 10, 1, 5, f'{loss_in:.1f}%' if loss_in is not None else '', 'lost_in'),
+             line('late ↓', late_in, 10, 1, 5, f'{late_in:.1f}%' if late_in is not None else '', 'late_in')]
+    if jitter:
+        lines += [line('jitter ↑', jitter_out, 100, 30, 60, f'{jitter_out:.0f} ms' if jitter_out is not None else ''),
+                  line('jitter ↓', jitter_in, 100, 30, 60, f'{jitter_in:.0f} ms' if jitter_in is not None else '')]
+    return lines
+
+
+def network_text(rtt, loss_out, loss_in):
+    """The same in a line, when the panel has no room on the left."""
+    def value(number, unit, digits=0):
+        return '-' if number is None else f'{number:.{digits}f}{unit}'
+    return f' {DIM}rtt{RESET} {value(rtt, " ms")}  {DIM}loss{RESET} ↑{value(loss_out, "%", 1)} ↓{value(loss_in, "%", 1)}'
+
+
+def visible_length(text):
+    return len(_ESCAPE.sub('', text))
+
+
+def with_sidebar(lines, sidebar, width):
+    """The panel's lines with sidebar on the left of all but the title (cut to width, then a rule)."""
+    out = lines[:1]
+    for index, line in enumerate(lines[1:]):
+        side = fit(sidebar[index], width - 2) if index < len(sidebar) else ''
+        out.append(side + ' ' * max(0, width - 2 - visible_length(side)) + DIM + '│' + RESET + ' ' + line)
+    return out
+
+
+class StatusPanel(object):
+    """A panel fixed at the top of the terminal (its first height lines), the console scrolling under it: an ANSI
+    scroll region (DECSTBM), so print and the log go on as before. Only on a terminal; update(lines) redraws it."""
+
+    def __init__(self, height=None, fraction=None, minimum=8):
+        self.fixed_height, self.fraction, self.minimum = height, fraction, minimum
+        self.height = height or minimum
+        self.columns = 80
+        self.active = False
+        self.lines = []
+        self._stream = None
+        self._columns = 80
+        self.on_resize = None       # called when the terminal changes size, before redrawing: lines for the new size
+
+    def start(self):
+        """Whether the panel is shown (not when stdout is no terminal, or too small)."""
+        stream = getattr(sys.stdout, 'stream', sys.stdout)      # past the log file copy (_Tee): the panel is not logged
+        try:
+            if not stream.isatty() or os.environ.get('TERM', 'dumb') == 'dumb':
+                return False
+        except Exception:
+            return False
+        self._stream = stream
+        if not self._setup(first=True):
+            return False
+        self.active = True
+        import atexit
+        import signal
+        if hasattr(signal, 'SIGWINCH'):
+            signal.signal(signal.SIGWINCH, lambda signum, frame: reactor.callLater(0, self._resized))
+        atexit.register(self.stop)
+        return True
+
+    def _setup(self, first=False):
+        import shutil
+        columns, rows = shutil.get_terminal_size((80, 24))
+        height = self.fixed_height or max(self.minimum, int(rows * self.fraction))
+        height = min(height, rows - 4)          # the console keeps 4 lines at least
+        if height < self.minimum:
+            return False
+        self.height = height
+        self._columns, self._rows = columns, rows
+        self.columns = columns
+        self._write(('\n' * self.height if first else '')         # what is on the screen moves up, out of its way
+                    + f'\x1b[{self.height + 1};{rows}r'            # the scroll region: under the panel
+                    + f'\x1b[{rows};1H')                           # back at the bottom, where the console goes on
+        return True
+
+    def _resized(self):
+        if self.active and self._setup():
+            self._write('\x1b7' + ''.join(f'\x1b[{index + 1};1H\x1b[2K' for index in range(self.height)) + '\x1b8')
+            if self.on_resize is not None:
+                self.on_resize()
+            self._draw()
+
+    def update(self, lines):
+        self.lines = list(lines)
+        if self.active:
+            self._draw()
+
+    def _draw(self):
+        out = '\x1b7'      # the cursor, kept: what is typed, and the log, go on where they were
+        for index in range(self.height):
+            text = self.lines[index] if index < len(self.lines) else ''
+            out += f'\x1b[{index + 1};1H\x1b[2K' + fit(text, self._columns - 1)
+        self._write(out + '\x1b8')
+
+    def stop(self):
+        if not self.active:
+            return
+        self.active = False
+        self._write(f'\x1b[r\x1b[{self._rows};1H\n')      # the whole screen scrolls again
+
+    def _write(self, text):
+        # one write at a time with the log handlers (they write from other threads too), after what they have pending
+        handlers = list(logging.getLogger().handlers)
+        for handler in handlers:
+            handler.acquire()
+        try:
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except Exception:
+                    pass
+            data, fd = text.encode('utf-8'), self._stream.fileno()
+            while data:
+                try:
+                    data = data[os.write(fd, data):]
+                except BlockingIOError:
+                    import select
+                    select.select([], [fd], [], 1)
+        except OSError:
+            pass
+        finally:
+            for handler in reversed(handlers):
+                handler.release()
+
+
 class Statistics(object):
     """The traffic of a session's streams (its media's stats(): [(label, direction, stats)]): sampled every
     SAMPLE_INTERVAL s, logged every interval s, summed on leaving (earlier connections of the same run included)."""
 
     SAMPLE_INTERVAL = 5
     LIVE_INTERVAL = 2
+    TICK = 0.25                 # s between measures of the audio levels (self.current: the panel, the live lines)
+    STATS_TICK = 1              # s between those of the RTP statistics (webrtcbin's get-stats)
+    HOLD = 10                   # s: the panel's loss and late bars show the worst of this long (a short burst stays seen)
 
     def __init__(self, interval):
         self.interval = interval
@@ -276,7 +904,11 @@ class Statistics(object):
         self._logger = None
         self.live = False
         self._live = None
-        self._live_previous = {}    # (label, direction) -> (bytes, packets, lost, time) at the last live line
+        self._live_previous = {}    # (label, direction) -> (bytes, packets, lost, time) at the last measure
+        self.current = []           # the latest measure: one dict per stream, see measure()
+        self._stats_time = None     # when the RTP statistics were last asked for
+        self.strip_levels = {}      # the send mixer's strip name -> its level, of the latest measure
+        self._ticker = None
 
     def start(self, session):
         """A connection is established."""
@@ -287,6 +919,10 @@ class Statistics(object):
             self.started = reactor.seconds()
         self._sampler = self._sampler or RepeatingTimer(self.SAMPLE_INTERVAL, self.sample)
         self._sampler.start()
+        self._live_previous, self.current, self._stats_time = {}, [], None
+        self._holds = {}
+        self._ticker = self._ticker or RepeatingTimer(self.TICK, self.measure)
+        self._ticker.start()
         if self.interval and self._logger is None:
             self._logger = RepeatingTimer(self.interval, self.log)
             self._logger.start()
@@ -297,9 +933,12 @@ class Statistics(object):
         for key in self.earlier:
             self.earlier[key] += totals[key]
         self.samples, self.session = {}, None
+        self.current = []
+        if self._ticker is not None:
+            self._ticker.stop()
 
     def stop(self):
-        for timer in (self._sampler, self._logger, self._live):
+        for timer in (self._sampler, self._logger, self._live, self._ticker):
             if timer is not None:
                 timer.stop()
 
@@ -341,50 +980,90 @@ class Statistics(object):
             self._live.stop()
         return self.live
 
-    def log_live(self):
-        """One line per stream: rate and packets per second since the last line, bytes, loss, jitter, round trip time
-        and its audio level (RMS and peak since the last line)."""
+    def measure(self):
+        """Every TICK s while connected, self.current: per stream (ours first) a dict of label, direction, bytes,
+        rate (bit/s) and pps since the last measure (None at the first), loss (a fraction: the far end's report for
+        what we send, ours since the last measure for what we get), jitter and rtt (s), level ((RMS, peak) dBFS since
+        the last measure); None where not known."""
         session = self.session
         media = getattr(session, 'media', None)
         if session is None or session.state != 'established' or getattr(media, 'pipeline', None) is None:
+            self.current = []
             return
+        now = reactor.seconds()
         try:
-            streams = media.stats()
             levels = media.levels() if hasattr(media, 'levels') else {}
+            self.strip_levels = {label: level for (label, direction), level in levels.items() if direction == 'strip'}
+            if self._stats_time is not None and now - self._stats_time < self.STATS_TICK - 0.01:
+                # the levels only: the statistics are those of the last second
+                self.current = [dict(row, level=levels.get((row['label'], row['direction']))) for row in self.current]
+                return
+            self._stats_time = now
+            streams = media.stats()
         except Exception as e:
             log.debug(f'statistics: {e}')
             return
-        now = reactor.seconds()
+        rows = []
         for label, direction, stats in sorted(streams, key=lambda item: (item[1] != 'out', item[0])):
             key = (label, direction)
             self.samples[key] = stats
+            late = stats.get('late_received', 0) if direction == 'in' else 0
             if direction == 'out':
                 count, packets, lost = stats['sent_bytes'], stats['sent_packets'], 0
             else:
                 count, packets, lost = stats['received_bytes'], stats['received_packets'], stats['lost_received']
             before = self._live_previous.get(key)
-            self._live_previous[key] = (count, packets, lost, now)
-            part = f'{label} {direction}'
+            self._live_previous[key] = (count, packets, lost, now, late)
+            row = dict(label=label, direction=direction, bytes=count, rate=None, pps=None, loss=None, jitter=None, rtt=None,
+                       level=levels.get(key), late=None)
             if before is not None:
                 elapsed = max(1e-3, now - before[3])
                 new_packets, new_lost = max(0, packets - before[1]), max(0, lost - before[2])
-                part += f' {human_rate(8.0 * max(0, count - before[0]) / elapsed)} {new_packets / elapsed:.0f} pkt/s'
-            part += f' {human_bytes(count)}'
+                row['rate'] = 8.0 * max(0, count - before[0]) / elapsed
+                row['pps'] = new_packets / elapsed
+                if direction == 'in':
+                    row['loss'] = new_lost / (new_packets + new_lost) if new_packets + new_lost else 0.0
+                    new_late = max(0, late - (before[4] if len(before) > 4 else 0))
+                    row['late'] = new_late / new_packets if new_packets else 0.0      # came, but too late: gaps
             if direction == 'out':
-                if stats['fraction_lost_sent'] is not None:
-                    part += f' loss {100.0 * stats["fraction_lost_sent"]:.1f}%'
-                if stats.get('jitter_sent') is not None:
-                    part += f' jitter {stats["jitter_sent"] * 1000:.0f} ms'
-                if stats['rtt'] is not None:
-                    part += f' rtt {stats["rtt"] * 1000:.0f} ms'
+                row['loss'] = stats['fraction_lost_sent']
+                row['jitter'] = stats.get('jitter_sent')
+                row['rtt'] = stats['rtt']
             else:
-                if before is not None:
-                    part += f' loss {loss(new_lost, new_packets + new_lost)}'
-                if stats.get('jitter_received') is not None:
-                    part += f' jitter {stats["jitter_received"] * 1000:.0f} ms'
-            level = levels.get(key)
-            if level is not None:
-                part += ' ' + meter(level)
+                row['jitter'] = stats.get('jitter_received')
+            rows.append(row)
+        # the worst loss and lateness of the last HOLD s (loss_held, late_held), and what was lost and late since the
+        # connection started (lost_total, late_total)
+        holds = self.__dict__.setdefault('_holds', {})
+        for row, (label, direction, stats) in zip(rows, sorted(streams, key=lambda item: (item[1] != 'out', item[0]))):
+            for name in ('loss', 'late'):
+                history = holds.setdefault((label, direction, name), [])
+                if row[name] is not None:
+                    history.append((now, row[name]))
+                history[:] = [(when, number) for when, number in history if now - when <= self.HOLD]
+                row[name + '_held'] = max(number for when, number in history) if history else row[name]
+            row['lost_total'] = stats['lost_received'] if direction == 'in' else stats['lost_sent']
+            row['late_total'] = stats.get('late_received', 0) if direction == 'in' else None
+        self.current = rows
+
+    def log_live(self):
+        """r: the latest measure, one line per stream: rate, packets per second, bytes, loss, jitter, round trip time
+        and the audio level."""
+        for row in self.current:
+            part = f'{row["label"]} {row["direction"]}'
+            if row['rate'] is not None:
+                part += f' {human_rate(row["rate"])} {row["pps"]:.0f} pkt/s'
+            part += f' {human_bytes(row["bytes"])}'
+            if row['loss'] is not None:
+                part += f' loss {100.0 * row["loss"]:.1f}%'
+            if row.get('late'):
+                part += f' late {100.0 * row["late"]:.1f}%'
+            if row['jitter'] is not None:
+                part += f' jitter {row["jitter"] * 1000:.0f} ms'
+            if row['rtt'] is not None:
+                part += f' rtt {row["rtt"] * 1000:.0f} ms'
+            if row['level'] is not None:
+                part += ' ' + meter(row['level'])
             log.info('rtp: ' + part)
 
     def lines(self):
@@ -466,11 +1145,14 @@ class Console(LineReceiver):
 
     delimiter = os.linesep.encode()
 
+    ARROWS = {'A': 'up', 'B': 'down', 'C': 'right', 'D': 'left'}
+
     def __init__(self, client):
         self.client = client
         self._key_callback = None
         self._saved_tty = None
         self._restore_registered = False
+        self._pending = ''          # the start of an escape sequence (an arrow key) that came without its end
 
     def lineReceived(self, line):
         self.client.input(line.decode('utf-8', 'replace').strip())
@@ -502,10 +1184,22 @@ class Console(LineReceiver):
         self.setLineMode()
 
     def rawDataReceived(self, data):
-        for key in data.decode('utf-8', 'replace'):
+        # single keys; the arrow keys (ESC [ A..D, or ESC O A..D) as 'up', 'down', 'right', 'left'
+        text, self._pending = self._pending + data.decode('utf-8', 'replace'), ''
+        index = 0
+        while index < len(text):
             callback = self._key_callback
             if callback is None:
                 break
+            key = text[index]
+            index += 1
+            if key == '\x1b':
+                if len(text) - index < 2 and text[index:] in ('', '[', 'O'):
+                    self._pending = key + text[index:]
+                    break
+                if len(text) - index >= 2 and text[index] in '[O' and text[index + 1] in self.ARROWS:
+                    key = self.ARROWS[text[index + 1]]
+                    index += 2
             if key == '\r':
                 key = '\n'     # Enter, as one key
             if callback(key):
