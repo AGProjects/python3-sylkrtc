@@ -186,6 +186,10 @@ class VideoroomSession(object):
         self.device_name = device_name
         self.id = str(uuid.uuid4())
         self.state = 'idle'                 # idle, connecting, accepted, established, terminated
+        self.stereo_room = False            # the room has stereo audio (told when accepted)
+        self.audio_levels = {}              # participant id -> its latest entry of the room's audio levels (SIP side)
+        self.audio_levels_events = 0        # conference-audio-levels events received
+        self.audio_levels_time = None       # when the latest came (monotonic)
         self.reason = ''
         self.participants = {}              # publisher id -> Participant
         self.feeds = {}                     # feed id -> Participant
@@ -193,6 +197,7 @@ class VideoroomSession(object):
         self.raised_hands = []
         self.extra_videos = {}              # session id -> ExtraVideo
         self.audio_muted = not audio
+        self.listen_only = False            # our audio offered inactive: nothing sent (a recorder; RoomMedia.start)
         self.video = video
         self.video_codec = self.video_pt = None     # what our own publisher sends, when it sends video
         self.video_paused = not receive_video
@@ -515,6 +520,7 @@ class VideoroomSession(object):
         if state == 'progress':
             self.log('the server is joining the room')
         elif state == 'accepted':
+            self.stereo_room = bool(message.get('stereo'))      # the room mixes stereo audio (SylkServer with stereo rooms)
             self._set_state('accepted')
             self._on_answer(message.get('sdp') or '')
         elif state == 'established':
@@ -592,6 +598,15 @@ class VideoroomSession(object):
         levels = message.get('levels') or []
         if isinstance(levels, dict):
             levels = [dict(entry, participant_id=pid) for pid, entry in levels.items()]
+        # the levels of the room's SIP side (the conference mixer's, through the server): kept for the statistics
+        if not self.audio_levels_events:
+            self.log(f'first conference audio levels from the server ({len(levels)} participant(s))')
+        self.audio_levels_events += 1
+        self.audio_levels_time = monotonic()
+        for entry in levels:
+            pid = str(entry.get('participant_id') or '')
+            if pid:
+                self.audio_levels[pid] = entry
         for entry in levels:
             participant = self.participants.get(str(entry.get('participant_id') or ''))
             if participant is None:

@@ -9,6 +9,8 @@ import os
 import sys
 import time
 
+from time import monotonic
+
 from application.notification import IObserver, NotificationCenter
 from twisted.internet import reactor
 from twisted.protocols.basic import LineReceiver
@@ -410,9 +412,35 @@ class Statistics(object):
                 part += f' loss {loss(stats["lost_received"], stats["received_packets"] + stats["lost_received"])}'
             parts.append(part)
         totals = self._totals(self.samples)
-        return parts + [f'total sent {human_bytes(totals["sent"])} ({human_rate(rates["out"])}), received {human_bytes(totals["received"])} ({human_rate(rates["in"])})'
+        return parts + self._level_lines() + [f'total sent {human_bytes(totals["sent"])} ({human_rate(rates["out"])}), received {human_bytes(totals["received"])} ({human_rate(rates["in"])})'
                         + (f', rtt avg {1000 * sum(rtts) / len(rtts):.0f} ms max {1000 * max(rtts):.0f} ms' if rtts else '')
                         + f', loss sent {loss(totals["lost_sent"], totals["sent_packets"])} received {loss(totals["lost_received"], totals["received_packets"] + totals["lost_received"])}']
+
+    def _level_lines(self):
+        """The room's SIP side audio levels, as the server sends them (conference-audio-levels: the conference
+        mixer's, 0-127 u-law scale): how many came since the last report, and each participant's latest, rx (what it
+        says) and tx (what it hears), mean/peak, and left/right in a stereo room. [] for a session without them."""
+        session = self.session
+        if session is None or not hasattr(session, 'audio_levels_events'):
+            return []
+        count = session.audio_levels_events
+        before = getattr(self, '_levels_logged', 0)
+        self._levels_logged = count
+        if not count:
+            return ['levels: none received from the server yet (the room\'s SIP side levels)']
+        age = monotonic() - session.audio_levels_time if session.audio_levels_time is not None else None
+        line = f'levels: {count - before} received' + (f', latest {age:.1f} s ago' if age is not None else '')
+        lines = [line]
+        for pid, entry in sorted(session.audio_levels.items()):
+            participant = session.participants.get(pid)
+            name = participant.name if participant is not None else pid[:12]
+            part = f'levels: {name} rx {entry.get("rx", "?")}/{entry.get("rx_peak", "?")} tx {entry.get("tx", "?")}/{entry.get("tx_peak", "?")}'
+            if entry.get('rx_peak_lr') or entry.get('rx_lr'):
+                rx_lr = entry.get('rx_peak_lr') or entry.get('rx_lr')
+                tx_lr = entry.get('tx_peak_lr') or entry.get('tx_lr') or ['?', '?']
+                part += f' L/R peak rx {rx_lr[0]}/{rx_lr[1]} tx {tx_lr[0]}/{tx_lr[1]}'
+            lines.append(part)
+        return lines
 
     def summary(self):
         """On leaving: everything this run sent and received."""

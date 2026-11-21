@@ -91,7 +91,7 @@ class ServerAPI(object):
         """One request; SystemExit with what went wrong unless its status is below 400 or in allow."""
         url = self.url(path)
         # who we are, on every request: the server lists the devices that use the account
-        headers = {'Authorization': f'Apikey {self.token}', 'User-Agent': self.user_agent,
+        headers = {'Authorization': f'Apikey {self.token}', 'User-Agent': self.user_agent, 'X-Sylk-User-Agent': self.user_agent,
                    'X-Sylk-Device-Id': self.device_id,
                    'X-Sylk-Device-Name': urllib.parse.quote(self.device_name, safe=" '()")}
         headers.update(kw.pop('headers', {}))

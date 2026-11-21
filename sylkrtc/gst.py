@@ -27,12 +27,13 @@ thread safe entry points.
 
 import logging
 import math
+import os
 import random
 import re
 import threading
 import time
 
-from sylkrtc.sdp import chosen_video_codec, complete_answer, cvo_id, has_media, ice_urls, mids, offered_codecs, with_cvo
+from sylkrtc.sdp import chosen_video_codec, complete_answer, cvo_id, has_media, ice_urls, mids, offered_codecs, with_cvo, with_opus_stereo
 
 
 __all__ = ['MediaFactory', 'RoomMedia', 'ExtraMedia', 'CallMedia', 'VideoFrame', 'media_missing', 'media_report', 'AudioDevice', 'audio_devices', 'RESOLUTIONS', 'parse_resolution', 'webrtcbin_stats']
@@ -51,6 +52,11 @@ except (ImportError, ValueError) as e:
     _gi_error = str(e)
 else:
     _gi_error = None
+try:
+    gi.require_version('GstRtp', '1.0')
+    from gi.repository import GstRtp
+except (ImportError, ValueError, NameError):
+    GstRtp = None
 
 
 # What a publisher can offer, in order of preference: (encoding name, payload type, encoder, payloader)
@@ -278,6 +284,84 @@ class _Levels(object):
         return (10 * math.log10(power) if power > 1e-10 else -100.0, entry[2])
 
 
+# Stereo audio (music: a stereo room, a stereo call): Opus in stereo at this
+# bitrate, tuned for any audio, no echo canceller (it takes mono)
+STEREO_BITRATE = 128000
+
+
+def _opus_encoder(stereo):
+    if stereo:
+        return _make('opusenc', bitrate=STEREO_BITRATE, inband_fec=True, audio_type='generic')
+    return _make('opusenc', bitrate=32000, inband_fec=True, audio_type='voice')
+
+
+def _opus_caps(pt, stereo):
+    """The caps of our Opus RTP, stereo=1;sprop-stereo=1 when stereo (webrtcbin puts them in the fmtp)."""
+    caps = f'application/x-rtp,media=audio,encoding-name=OPUS,payload={pt},clock-rate=48000,encoding-params=(string)2'
+    if stereo:
+        caps += ',stereo=(string)1,sprop-stereo=(string)1'
+    return Gst.Caps.from_string(caps)
+
+
+# The level of our microphone in what we send (RFC 6464 ssrc-audio-level): Janus' talking events, the meter of
+# our tile in the video room and in the gateway's admin page, come from it
+SSRC_AUDIO_LEVEL_URI = 'urn:ietf:params:rtp-hdrext:ssrc-audio-level'
+SSRC_AUDIO_LEVEL_ID = 1
+
+
+_audio_level_reported = False
+
+
+def _audio_level_missing():
+    """What GStreamer lacks to send the ssrc-audio-level extension (None: nothing): the level element puts the level
+    of each buffer on it (audio-level-meta, GStreamer 1.20), rtphdrextclientaudiolevel writes it in the RTP header."""
+    if GstRtp is None:
+        return 'the GstRtp introspection data (gir1.2-gst-plugins-base-1.0)'
+    if not _has('level'):
+        return 'the level element (gstreamer1.0-plugins-good)'
+    if not _has('rtphdrextclientaudiolevel'):
+        return 'the rtphdrextclientaudiolevel element (gstreamer1.0-plugins-good 1.20 or later)'
+    level = Gst.ElementFactory.make('level', None)
+    if level is None or level.find_property('audio-level-meta') is None:
+        return 'the audio-level-meta property of level (GStreamer 1.20 or later)'
+    return None
+
+
+def _audio_level_supported():
+    global _audio_level_reported
+    missing = _audio_level_missing()
+    if missing is not None and not _audio_level_reported:
+        _audio_level_reported = True
+        log.warning(f'our audio does not carry its level (ssrc-audio-level, RFC 6464): no {missing}; the room cannot show when we talk')
+    return missing is None
+
+
+def _audio_level_meter():
+    """The element that measures our microphone for ssrc-audio-level ([] when not supported)."""
+    if not _audio_level_supported():
+        return []
+    return [_make('level', 'audiolevelmeta', audio_level_meta=True, post_messages=False)]
+
+
+def _add_audio_level_extension(payloader, caps):
+    """Make payloader write ssrc-audio-level, and caps (those webrtcbin offers) name it (a=extmap). The caps,
+    with the extension or without it."""
+    if not _audio_level_supported():
+        return caps
+    extension = GstRtp.RTPHeaderExtension.create_from_uri(SSRC_AUDIO_LEVEL_URI)
+    if extension is None:
+        return caps
+    extension.set_id(SSRC_AUDIO_LEVEL_ID)
+    payloader.emit('add-extension', extension)
+    caps = caps.copy()
+    caps.get_structure(0).set_value('extmap-%d' % SSRC_AUDIO_LEVEL_ID, SSRC_AUDIO_LEVEL_URI)
+    return caps
+
+
+def _stereo_caps():
+    return _make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,channels=2'))
+
+
 def _link_chain(pipeline, elements, add=True):
     if add:
         for element in elements:
@@ -420,16 +504,24 @@ class MediaFactory(object):
     audio_output: 'auto' (the default speakers), 'none' or a GStreamer sink description.
     video_sink: None (the feeds' video is not decoded), or a callable(participant) that returns a GStreamer
     sink element for that participant's decoded video.
+    stereo: stereo audio (sent and played), for a stereo room (a new one becomes stereo): Opus in stereo, no echo
+    canceller.
     """
 
-    def __init__(self, audio_input='auto', audio_output='auto', video_sink=None, video_source=None):
+    def __init__(self, audio_input='auto', audio_output='auto', video_sink=None, video_source=None, record_tracks=None,
+                 track_paths=None, stereo=False):
         self.audio_input = audio_input
         self.audio_output = audio_output
         self.video_sink = video_sink
         self.video_source = video_source
+        self.stereo = stereo
+        self.record_tracks = record_tracks      # a folder: each participant's audio into a file of its own there
+        self.track_paths = track_paths          # a list the files' paths are added to, as they are made
 
     def __call__(self, session):
-        return RoomMedia(session, self.audio_input, self.audio_output, self.video_sink, self.video_source)
+        media = RoomMedia(session, self.audio_input, self.audio_output, self.video_sink, self.video_source, self.stereo)
+        media.record_tracks, media.track_paths = self.record_tracks, self.track_paths
+        return media
 
 
 class RoomMedia(object):
@@ -438,12 +530,13 @@ class RoomMedia(object):
 
     MAIN_FPS = 15
 
-    def __init__(self, session, audio_input='auto', audio_output='auto', video_sink=None, video_source=None):
+    def __init__(self, session, audio_input='auto', audio_output='auto', video_sink=None, video_source=None, stereo=False):
         self.session = session
         self.audio_input = audio_input
         self.audio_output = audio_output
         self.video_sink = video_sink
         self.video_source = video_source
+        self.stereo = stereo
         self.pipeline = None
         self.publisher = None
         self._mixer = None
@@ -451,6 +544,10 @@ class RoomMedia(object):
         self._video_pad = None
         self._video_ssrc = random.randint(1, 0xffffffff)
         self._levels = _Levels()
+        self.record_tracks = None       # a folder (MediaFactory): a FLAC per participant, see _record_track
+        self.track_paths = None
+        self._tracks_origin = None      # when the tracks start (time.monotonic(): the media started)
+        self._tracks = []               # their branches: [(first element, [elements])], ended at finish_tracks
 
     # The publisher
 
@@ -462,12 +559,13 @@ class RoomMedia(object):
             raise RuntimeError('our own video must be a local camera (v4l2 or test)')
         self.pipeline = Gst.Pipeline.new('videoroom')
         self.pipeline.use_clock(Gst.SystemClock.obtain())     # the microphone or speakers may change while playing
+        self._tracks_origin = time.monotonic()
         self.pipeline.get_bus().set_sync_handler(self._on_bus_message, None)
-        echo_cancellation = self.audio_input != 'none' and self.audio_output != 'none' and _has('webrtcdsp') and _has('webrtcechoprobe')
+        echo_cancellation = not self.stereo and self.audio_input != 'none' and self.audio_output != 'none' and _has('webrtcdsp') and _has('webrtcechoprobe')
 
-        # what is played: every feed's audio, mixed
+        # what is played: every feed's audio, mixed (in stereo for a stereo room)
         self._mixer = _make('audiomixer', 'mixer', ignore_inactive_pads=True)
-        playback = [self._mixer, _make('audioconvert'), _make('audioresample')]
+        playback = [self._mixer] + ([_stereo_caps()] if self.stereo else []) + [_make('audioconvert'), _make('audioresample')]
         if echo_cancellation:
             playback.append(_make('webrtcechoprobe', 'echoprobe'))
         playback.append(self._audio_element(self.audio_output, 'speakers', sink=True))
@@ -482,16 +580,22 @@ class RoomMedia(object):
         if echo_cancellation:
             microphone += [_make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,rate=48000,channels=1')), _make('webrtcdsp', 'dsp', probe='echoprobe')]
         self._volume = _make('volume', 'micvolume', mute=self.session.audio_muted)
-        microphone += [self._volume] + _level('miclevel') + [_make('audioconvert'), _make('audioresample'),
+        payloader = _make('rtpopuspay', pt=OPUS_PT)
+        microphone += [self._volume] + _level('miclevel') + [_make('audioconvert'), _make('audioresample')] + ([_stereo_caps()] if self.stereo else []) + \
+                      _audio_level_meter() + [
                        _make('queue', max_size_time=200 * Gst.MSECOND, leaky='downstream'),
-                       _make('opusenc', bitrate=32000, inband_fec=True, audio_type='voice'),
-                       _make('rtpopuspay', pt=OPUS_PT)]
-        audio_caps = Gst.Caps.from_string(f'application/x-rtp,media=audio,encoding-name=OPUS,payload={OPUS_PT},clock-rate=48000,encoding-params=(string)2')
+                       _opus_encoder(self.stereo),
+                       payloader]
+        audio_caps = _add_audio_level_extension(payloader, _opus_caps(OPUS_PT, self.stereo))
+        if audio_caps.get_structure(0).has_field('extmap-%d' % SSRC_AUDIO_LEVEL_ID):
+            log.info('our audio carries its level (ssrc-audio-level, RFC 6464): the room shows when we talk')
         microphone.append(_make('capsfilter', caps=audio_caps))
         _link_chain(self.pipeline, microphone)
         audio_pad = webrtcbin.request_pad_simple('sink_%u')
         transceiver = audio_pad.get_property('transceiver')
-        transceiver.set_property('direction', GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY)
+        # listening only (session.listen_only: a recorder): offered inactive, nothing of ours sent
+        transceiver.set_property('direction', GstWebRTC.WebRTCRTPTransceiverDirection.INACTIVE
+                                 if getattr(self.session, 'listen_only', False) else GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY)
         transceiver.set_property('codec-preferences', audio_caps)     # the offer is made before the microphone has caps
         if microphone[-1].get_static_pad('src').link(audio_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError('cannot link the microphone to webrtcbin')
@@ -533,7 +637,10 @@ class RoomMedia(object):
             self.session.media_error('publisher', 'cannot create the offer', True)
             return
         self.publisher.emit('set-local-description', offer, Gst.Promise.new())
-        self.session.publisher_offer(offer.sdp.as_text())
+        text = offer.sdp.as_text()
+        if self.stereo:
+            text = with_opus_stereo(text)      # what makes the room stereo (whatever this GStreamer puts in the fmtp)
+        self.session.publisher_offer(text)
 
     def set_publisher_answer(self, sdp):
         if self._video_pad is not None:
@@ -665,18 +772,114 @@ class RoomMedia(object):
         if kind.startswith('audio/'):
             chain = [_make('queue', max_size_buffers=0, max_size_bytes=0, max_size_time=RECEIVED_AUDIO_QUEUE * Gst.SECOND, leaky='downstream'), _make('audioconvert'), _make('audioresample'),
                      _make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,rate=48000,channels=2'))]
+            tee = _make('tee') if self.record_tracks else None
+            if tee is not None:         # its own file too (record_tracks), from the tee
+                chain += [tee, _make('queue')]
             if _has('level'):
                 chain.append(_make('level', 'level-' + participant.feed, interval=LEVEL_INTERVAL, post_messages=True))
             self._add_branch(participant, chain, pad)
             mixer_pad = self._mixer.request_pad_simple('sink_%u')
             chain[-1].get_static_pad('src').link(mixer_pad)
             participant.media['mixer_pads'].append(mixer_pad)
+            if tee is not None:
+                try:
+                    self._record_track(participant, tee)
+                except Exception as e:
+                    log.warning(f'{self.session.room}: cannot record {participant.name} on a track of its own: {e}')
         elif kind.startswith('video/') and self.video_sink is not None:
             self._add_branch(participant, [_make('queue', max_size_buffers=2, leaky='downstream'), _make('videoconvert'), self.video_sink(participant)], pad)
         else:
             self._discard(participant, pad)
 
+    # Each participant's own track (record_tracks): FLAC, 48 kHz stereo, starting with as much silence as the
+    # participant came after the recording started, so every track starts at the same moment (laid side by side in a
+    # DAW, they line up). Someone leaving and coming back: a new file ("Name 2"), also aligned.
+
+    TRACK_CAPS = 'audio/x-raw,format=F32LE,layout=interleaved,rate=48000,channels=2'
+
+    def _track_path(self, participant):
+        name = re.sub(r'[/\\:\x00]', '_', participant.name or participant.uri or 'participant').strip() or 'participant'
+        path = os.path.join(self.record_tracks, name + '.flac')
+        number = 2
+        while os.path.exists(path) or (self.track_paths is not None and path in self.track_paths):
+            path = os.path.join(self.record_tracks, f'{name} {number}.flac')
+            number += 1
+        return path
+
+    def _record_track(self, participant, tee):
+        os.makedirs(self.record_tracks, mode=0o700, exist_ok=True)
+        path = self._track_path(participant)
+        offset = max(0.0, time.monotonic() - (self._tracks_origin or time.monotonic()))
+        quanta = int(round(offset * 100))       # 10 ms buffers of silence before it
+        # (while its silence is written, the participant's audio waits here; never holding the tee up, so the room
+        # plays on: FLAC writes silence much faster than real time, an hour's in seconds)
+        live = [_make('queue', max_size_buffers=0, max_size_bytes=0, max_size_time=30 * Gst.SECOND, leaky='downstream'), _make('audioconvert'),
+                _make('capsfilter', caps=Gst.Caps.from_string(self.TRACK_CAPS))]
+        # one segment from there on (the silence's, then the participant's running times: the encoder aborted on them)
+        tail = [_make('identity', single_segment=True), _make('audioconvert'), _make('flacenc'),
+                _make('filesink', location=path, sync=False, **{'async': False})]
+        elements = list(live) + tail
+        if quanta:
+            silence = [_make('audiotestsrc', wave='silence', is_live=False, samplesperbuffer=480, num_buffers=quanta),
+                       _make('capsfilter', caps=Gst.Caps.from_string(self.TRACK_CAPS))]
+            concat = _make('concat')
+            elements += silence + [concat]
+            for element in elements:
+                self.pipeline.add(element)
+            _link_chain(self.pipeline, silence, add=False)
+            _link_chain(self.pipeline, live, add=False)
+            silence[-1].get_static_pad('src').link(concat.request_pad_simple('sink_%u'))    # first the silence,
+            live[-1].get_static_pad('src').link(concat.request_pad_simple('sink_%u'))       # then the participant
+            concat.link(tail[0])
+            _link_chain(self.pipeline, tail, add=False)
+        else:
+            for element in elements:
+                self.pipeline.add(element)
+            _link_chain(self.pipeline, elements, add=False)
+        for element in reversed(elements):
+            element.sync_state_with_parent()
+        source = tee.request_pad_simple('src_%u') if hasattr(tee, 'request_pad_simple') else tee.get_request_pad('src_%u')
+        source.link(live[0].get_static_pad('sink'))
+        participant.media['track'] = (live[0], elements)
+        self._tracks.append((live[0], elements))
+        if self.track_paths is not None:
+            self.track_paths.append(path)
+        log.info(f'{self.session.room}: recording {participant.name} into {path}' + (f' (from {offset:.1f} s)' if quanta else ''))
+
+    def _end_track(self, track, later=True):
+        """The file closed (FLAC's header with its length): an end of stream into the track, its elements let go once
+        it has been written."""
+        first, elements = track
+        pad = first.get_static_pad('sink')
+        peer = pad.get_peer()
+        if peer is not None:
+            peer.unlink(pad)
+            parent = peer.get_parent_element()
+            if parent is not None and parent.get_factory().get_name() == 'tee':
+                parent.release_request_pad(peer)
+        pad.send_event(Gst.Event.new_eos())
+        if track in self._tracks:
+            self._tracks.remove(track)
+        if not later:
+            return
+
+        def release():
+            pipeline = self.pipeline
+            for element in elements:
+                element.set_state(Gst.State.NULL)
+                if pipeline is not None and element.get_parent() is pipeline:
+                    pipeline.remove(element)
+        threading.Timer(1.0, release).start()
+
+    def finish_tracks(self):
+        """Leaving: every track's file closed (before the pipeline is stopped)."""
+        for track in list(self._tracks):
+            self._end_track(track, later=False)
+
     def remove_feed(self, participant):
+        track = (participant.media or {}).get('track')
+        if track is not None and self.pipeline is not None:
+            self._end_track(track)          # (its elements not the feed's: they go a moment later)
         media, participant.media = participant.media, None
         if media is None or self.pipeline is None:
             return
@@ -969,12 +1172,15 @@ class CallMedia(object):
     video_output: what the remote video goes to: None (not even received), 'auto' (a window of GStreamer's own),
     a GStreamer sink description, or a callable(VideoFrame) (sipclient.video.VideoWindow.frame_handler).
     video_size: (width, height) the far end's video is scaled to, its aspect kept (borders); None: as it comes.
+    stereo: stereo audio: Opus in stereo (the call is stereo when the far end asks for it too), no echo canceller.
     """
 
     FPS = 15
 
-    def __init__(self, call, audio_input='auto', audio_output='auto', video_source=None, video_output=None, ice_servers=None, video_size=None):
+    def __init__(self, call, audio_input='auto', audio_output='auto', video_source=None, video_output=None, ice_servers=None, video_size=None,
+                 stereo=False):
         self.call = call
+        self.stereo = stereo
         self.audio_input = audio_input
         self.audio_output = audio_output
         self.video_source = video_source
@@ -1006,7 +1212,7 @@ class CallMedia(object):
         self.pipeline = Gst.Pipeline.new('call')
         self.pipeline.use_clock(Gst.SystemClock.obtain())     # the microphone or speakers may change while playing
         self.pipeline.get_bus().set_sync_handler(self._on_bus_message, None)
-        echo_cancellation = self.audio_input != 'none' and self.audio_output != 'none' and _has('webrtcdsp') and _has('webrtcechoprobe')
+        echo_cancellation = not self.stereo and self.audio_input != 'none' and self.audio_output != 'none' and _has('webrtcdsp') and _has('webrtcechoprobe')
 
         # one far end: its audio goes straight to the speakers, no mixer (an aggregator that outputs
         # silence and drops what comes after its deadline)
@@ -1038,10 +1244,10 @@ class CallMedia(object):
         if echo_cancellation:
             microphone += [_make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,rate=48000,channels=1')), _make('webrtcdsp', 'dsp', probe='echoprobe')]
         self._volume = _make('volume', 'micvolume', mute=self.call.audio_muted)
-        audio_caps = Gst.Caps.from_string(f'application/x-rtp,media=audio,encoding-name=OPUS,payload={opus_pt},clock-rate=48000,encoding-params=(string)2')
-        microphone += [self._volume] + _level('miclevel') + [_make('audioconvert'), _make('audioresample'),
+        audio_caps = _opus_caps(opus_pt, self.stereo)
+        microphone += [self._volume] + _level('miclevel') + [_make('audioconvert'), _make('audioresample')] + ([_stereo_caps()] if self.stereo else []) + [
                        _make('queue', max_size_time=200 * Gst.MSECOND, leaky='downstream'),
-                       _make('opusenc', bitrate=32000, inband_fec=True, audio_type='voice'),
+                       _opus_encoder(self.stereo),
                        _make('rtpopuspay', pt=opus_pt), _make('capsfilter', caps=audio_caps)]
         _link_chain(self.pipeline, microphone)
         audio_pad = webrtcbin.request_pad_simple('sink_%u')
@@ -1111,7 +1317,8 @@ class CallMedia(object):
             self.call.media_error('call', 'cannot create the offer', True)
             return
         self.webrtcbin.emit('set-local-description', offer, Gst.Promise.new())
-        self.call.local_description(offer.sdp.as_text(), 'offer')
+        text = offer.sdp.as_text()
+        self.call.local_description(with_opus_stereo(text) if self.stereo else text, 'offer')
 
     def set_answer(self, sdp):
         """The far end's answer to our offer."""
@@ -1158,7 +1365,7 @@ class CallMedia(object):
             except Exception as e:
                 self.call.media_error('camera', str(e), False)
         self.webrtcbin.emit('set-local-description', answer, Gst.Promise.new())
-        self.call.local_description(text, 'answer')
+        self.call.local_description(with_opus_stereo(text) if self.stereo else text, 'answer')
 
     def add_remote_candidate(self, mline, candidate):
         if self.webrtcbin is not None:

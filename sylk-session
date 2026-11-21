@@ -106,6 +106,7 @@ def parse_arguments():
     parser.add_argument('--audio-input', help='auto, none or a GStreamer source description')
     parser.add_argument('--audio-output', help='auto, none or a GStreamer sink description')
     parser.add_argument('--muted', action='store_true', default=None, help='start with the microphone muted')
+    parser.add_argument('--stereo', action='store_true', help='stereo audio: a stereo microphone (or the source of --audio-input) and Opus in stereo, no echo canceller; the call is stereo when the far end asks for stereo too')
     parser.add_argument('--auto-answer', type=float, nargs='?', const=0, default=None, metavar='SECONDS',
                         help='answer incoming calls by themselves (after this many seconds, default 0)')
     parser.add_argument('--discover', action='store_true', help='only look up the SylkServer configuration of the account\'s domain, cache it and show it')
@@ -187,6 +188,7 @@ class SylkCall(object):
         self.audio_input = arguments.audio_input if arguments.audio_input is not None else configuration.audio_input
         self.audio_output = arguments.audio_output if arguments.audio_output is not None else configuration.audio_output
         self.muted = arguments.muted if arguments.muted is not None else configuration.muted
+        self.stereo = arguments.stereo
         self.verify_tls = configuration.tls_verify_server
         if any(text.lower() == 'all' for text in arguments.local_camera):
             raise SystemExit('-c: a call sends one camera, name it (or leave -c out for the one attached)')
@@ -282,7 +284,7 @@ class SylkCall(object):
             self.window = output = RemoteVideo(f'{call.peer} - sylk-session')
         return CallMedia(call, audio_input=self.audio.chosen['input'], audio_output=self.audio.chosen['output'],
                          video_source=self.camera[1] if self.camera else None, video_output=output, ice_servers=self.server.ice_servers,
-                         video_size=self.video_size)
+                         video_size=self.video_size, stereo=self.stereo)
 
     def place_call(self, uri):
         if self.call is not None:

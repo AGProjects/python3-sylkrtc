@@ -22,6 +22,15 @@ session, else the default account of the first that has one.
     sylk-conference                    the default session
     sylk-conference garden             the session named garden (or whose room is garden)
     sylk-conference myroom@example.com a room without a session: general settings, no cameras
+    sylk-conference --headless --record-audio myroom
+                                       listen only (no microphone, speakers or camera) and record the room
+
+Recordings (--record-audio) go to ~/.sylkclient/recordings/<room's SIP URI>/<YYYYmmdd-HHMMSS>.ogg (Opus), a
+file each time the room is joined; --record-tracks also (or only) a FLAC per participant in
+<YYYYmmdd-HHMMSS>-tracks/<name>.flac, each starting at the same moment (silence until they came: laid side by
+side in a DAW, they line up). While recording, we are in the room as "● Recording", so everyone knows; with
+--headless we send nothing (our audio offered inactive; muted silence when the server does not take that).
+Where the files are is shown when it ends.
 
 Typed lines are sent to the room's chat; /help lists the commands. For a call
 to someone (1 to 1), see sylk-session.
@@ -31,6 +40,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 
 from application.notification import IObserver, NotificationCenter
 from application.python import Null
@@ -50,6 +60,9 @@ log = logging.getLogger('sylk-conference')
 
 from sylkrtc.device import USER_AGENT     # one device for all the tools (sylkrtc.device)
 RETRY_DELAYS = [5, 10, 20, 40, 60]      # s between attempts to join again / to restart a camera
+RECORDINGS = '~/.sylkclient/recordings'
+RECORDING_NAME = '\u25cf Recording'
+RECORD_BITRATE = 128000                 # bit/s: the room's mix, music as well as voices
 
 
 def parse_arguments():
@@ -67,24 +80,39 @@ def parse_arguments():
                              'else the built-in one; without a value or all, every camera attached; none (false, 0): no local camera; '
                              'a configured one by name or id, or LABEL=/dev/videoN or LABEL=test[:pattern], optionally followed by '
                              ',resolution=640x360 ,fps=10. The first local camera is our own video, the others are shown under it')
+    parser.add_argument('--no-video', action='store_true', help='join with audio (and chat) only: no camera of ours, no RTSP cameras, '
+                                                                    'whatever the session or the general settings have')
     parser.add_argument('-i', '--invite', action='append', default=[], metavar='USER',
                         help='invite someone once in the room (repeatable, or comma separated): user@domain, or user at the account\'s domain')
     parser.add_argument('--audio-input', help='auto, none or a GStreamer source description')
     parser.add_argument('--audio-output', help='auto, none or a GStreamer sink description')
     parser.add_argument('--muted', action='store_true', default=None, help='start with the microphone muted')
+    parser.add_argument('--headless', action='store_true',
+                        help='no microphone, no speakers and no camera (unless -c or -r asks for one): only listen, e.g. to record')
+    parser.add_argument('--record-tracks', nargs='?', const=RECORDINGS, default=None, metavar='FOLDER',
+                        help='record each participant on a track of its own, FLAC, into FOLDER/<room\'s SIP URI>/<time>-tracks/ '
+                             '(aligned: each starts at the same moment)')
+    parser.add_argument('--record-audio', nargs='?', const=RECORDINGS, default=None, metavar='FOLDER',
+                        help=f'record what the room plays (everyone else, mixed) as Ogg Opus into FOLDER/<room\'s SIP URI>/<time>.ogg '
+                             f'(default folder: {RECORDINGS})')
+    parser.add_argument('--stereo', action='store_true', help='stereo audio: a stereo microphone (or the source of --audio-input) and Opus in stereo, no echo canceller; a room made by joining it becomes a stereo room (one that exists keeps its own audio: mono participants hear and send mono)')
     parser.add_argument('--discover', action='store_true', help='only look up the SylkServer configuration of the account\'s domain (and of the room\'s, when given), cache it and show it')
     parser.add_argument('--server-info', action='store_true', help='connect to the SylkServer of the account (or of the room, when given) and report its version, '
                                                                   'what it supports and whether it takes the account')
     parser.add_argument('--stats-interval', type=float, default=60, metavar='SECONDS',
                         help='log the bandwidth, round trip time and loss of every stream this often (default %(default)g, 0: never); a summary is logged on leaving')
-    parser.add_argument('--auto-disconnect', type=float, default=600, metavar='SECONDS',
-                        help='leave the room and exit this many seconds after first getting in (default %(default)g, 10 minutes; 0: stay)')
+    parser.add_argument('--auto-disconnect', type=float, default=None, metavar='SECONDS',
+                        help='leave the room and exit this many seconds after first getting in (default 600, 10 minutes; '
+                             'with --record-audio 0; 0: stay)')
     parser.add_argument('--no-retry', action='store_true', help='exit when the room is left instead of joining again')
     parser.add_argument('--no-input', action='store_true', help='do not read chat messages and commands from the terminal')
     parser.add_argument('-v', '--verbose', '--debug', dest='debug', action='store_true', help='log debug messages')
     parser.add_argument('--sdp', action='store_true', help='log the SDP offers and answers exchanged')
     parser.add_argument('-t', '--trace', action='store_true', help='log the sylkRTC messages')
-    return parser.parse_args()
+    arguments = parser.parse_args()
+    if arguments.auto_disconnect is None:       # a recording runs until it is stopped (Ctrl-C, /quit)
+        arguments.auto_disconnect = 0 if arguments.record_audio or arguments.record_tracks else 600
+    return arguments
 
 
 @implementer(IObserver)
@@ -132,9 +160,21 @@ class SylkConference(object):
         self.audio_input = setting('audio_input', arguments.audio_input)
         self.audio_output = setting('audio_output', arguments.audio_output)
         self.muted = setting('muted', arguments.muted)
+        if arguments.headless:      # listening only: nothing of ours, nothing played here
+            self.audio_input = self.audio_output = 'none'
+            self.muted = True
+        self.recordings = []        # the files recorded (--record-audio), shown at the end
+        self.track_paths = []       # each participant's (--record-tracks), as they come
+        self._established = False   # the room got into at least once (the listen-only offer taken)
+        self.stereo = arguments.stereo
         self.verify_tls = configuration.tls_verify_server
-        self.cameras = select_cameras(configuration, arguments.rtsp_camera, arguments.local_camera, (session or {}).get('cameras'),
-                                      (session or {}).get('name'), default_local=not reporting)
+        if arguments.no_video:
+            if arguments.rtsp_camera or arguments.local_camera:
+                raise SystemExit('--no-video publishes no camera: leave out --rtsp-camera and --local-camera')
+            self.cameras = []
+        else:
+            self.cameras = select_cameras(configuration, arguments.rtsp_camera, arguments.local_camera, (session or {}).get('cameras'),
+                                          (session or {}).get('name'), default_local=not reporting and not arguments.headless)
         # a local camera (the first one) is our own video: the other cameras, the RTSP ones, are shown under it
         self.main_camera = next(((label, source) for label, source in self.cameras if source['kind'] in ('v4l2', 'test')), None)
         if self.main_camera is not None:
@@ -142,8 +182,12 @@ class SylkConference(object):
         if len(self.cameras) > MAX_EXTRA_VIDEOS:
             raise SystemExit(f'at most {MAX_EXTRA_VIDEOS} cameras besides our own video, {len(self.cameras)} asked for: {", ".join(label for label, source in self.cameras)}')
         self.discovery = Discovery(os.path.join(sipconfig.DEFAULT_DIRECTORY, 'sylkserver'))
-        self.identity = Identity.from_credentials(self.account.id, self.account.password, self.account.display_name,
+        self.recording = bool(arguments.record_audio or arguments.record_tracks)
+        # recording: in the room as "Recording", so everyone sees it is
+        display_name = RECORDING_NAME if self.recording else self.account.display_name
+        self.identity = Identity.from_credentials(self.account.id, self.account.password, display_name,
                                                   auth_username=self.account.auth_username, instance_id=self.account.instance_id)
+        self.listen_only = bool(arguments.headless and self.recording)     # nothing sent, if the server takes it
         self.target = None
         self.remote = False
         self.session = None
@@ -174,7 +218,7 @@ class SylkConference(object):
         print('\n'.join(f'* {line}' for line in self.audio.lines()))
         log.info(f'account {self.account.id} (from {os.path.join(self.config_dir, "config")}), room {self.room_text}'
                  + (f' (session {self.configuration_session["name"]})' if self.configuration_session else '')
-                 + (f', our video {self.main_camera[0]}' if self.main_camera else '')
+                 + (', audio only (--no-video)' if self.arguments.no_video else f', our video {self.main_camera[0]}' if self.main_camera else '')
                  + (f', cameras {", ".join(label for label, source in self.cameras)}' + (' (under it)' if self.main_camera else '') if self.cameras else ''))
         self.discovery.discover(self.account.domain).addCallback(self._own_configuration)
 
@@ -232,14 +276,65 @@ class SylkConference(object):
         if self.stopping:
             return
         from sylkrtc.gst import MediaFactory
+        tracks = None
+        if self.arguments.record_tracks:
+            tracks = os.path.join(os.path.expanduser(self.arguments.record_tracks), self.target.sip_uri.replace('/', '_'),
+                                  time.strftime('%Y%m%d-%H%M%S') + '-tracks')
+            print(f'* recording each participant into {tracks}/')
         self.session = VideoroomSession(self.identity, self.target.video_uri, self.target.ws_server,
-                                        MediaFactory(audio_input=self.audio.chosen['input'], audio_output=self.audio.chosen['output'],
+                                        MediaFactory(audio_input=self.audio.chosen['input'], audio_output=self._audio_output(), stereo=self.stereo,
+                                                     record_tracks=tracks, track_paths=self.track_paths,
                                                      video_source=self.main_camera[1] if self.main_camera else None),
                                         ice_servers=self.target.ice_servers, guest_domain=self.target.guest_domain if self.remote else None,
                                         audio=not self.muted, video=self.main_camera is not None, receive_video=False, user_agent=USER_AGENT,
                                         verify_tls=self.verify_tls)
+        self.session.listen_only = self.listen_only
         self.extras.clear()
         self.session.join()
+
+    # Recording (--record-audio): the room's mix, as played, also (or only, --headless) into a file
+
+    def _audio_output(self):
+        """What the room's audio is played into: the chosen speakers, and with --record-audio a new file as well."""
+        output = self.audio.chosen['output']
+        if not self.arguments.record_audio:
+            return output
+        folder = os.path.join(os.path.expanduser(self.arguments.record_audio), self.target.sip_uri.replace('/', '_'))
+        os.makedirs(folder, mode=0o700, exist_ok=True)
+        path = os.path.join(folder, time.strftime('%Y%m%d-%H%M%S') + '.ogg')
+        self.recordings.append(path)
+        print(f'* recording the room to {path}')
+        recorder = (f'audioconvert ! audioresample ! opusenc bitrate={RECORD_BITRATE} audio-type=generic ! oggmux ! '
+                    f'filesink location="{path}" sync=false async=false')
+        if output == 'none':
+            return recorder
+        if not isinstance(output, str):     # a device chosen by number: not in a description, so not played here
+            log.warning(f'recording: the speakers ({self.audio.describe(output)}) are not used while recording; '
+                        f'use --audio-output auto or a sink description to hear the room too')
+            return recorder
+        speakers = 'autoaudiosink' if output in ('', 'auto') else output
+        return f'tee name=recording ! queue ! {speakers} recording. ! queue ! {recorder}'
+
+    def _finish_recording(self):
+        """The file closed properly (Ogg's last page written): an end of stream sent into the speakers' branch."""
+        media = getattr(self.session, 'media', None)
+        if media is not None and hasattr(media, 'finish_tracks'):      # each participant's file closed too
+            media.finish_tracks()
+        pipeline = getattr(media, 'pipeline', None)
+        speakers = pipeline.get_by_name('speakers') if pipeline is not None and self.arguments.record_audio else None
+        pad = speakers.get_static_pad('sink') if speakers is not None else None
+        if pad is not None:
+            from sylkrtc.gst import Gst
+            pad.send_event(Gst.Event.new_eos())
+
+    def report_recordings(self):
+        for path in self.recordings + self.track_paths:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                print(f'* no recording made in {path}')
+                continue
+            print(f'* recorded: {path} ({size / 1024 / 1024:.1f} MB)' if size else f'* recorded nothing: {path} is empty')
 
     def _auto_leave(self):
         log.info(f'{self.arguments.auto_disconnect:g} s in the room: leaving (--auto-disconnect)')
@@ -250,6 +345,8 @@ class SylkConference(object):
         self.stopping = True
         self.statistics.summary()
         self.statistics.stop()
+        if self.recording and self.session is not None:
+            self._finish_recording()
         if self.session is not None and self.session.state not in ('idle', 'terminated'):
             self.session.leave()
             return deferLater(reactor, 0.5, lambda: None)      # the leave requests go out
@@ -273,9 +370,11 @@ class SylkConference(object):
         state = notification.data.state
         if state == 'established':
             self.attempt = 0
+            self._established = True
             self.statistics.start(self.session)
             log.info(f'in the room {self.session.room}' + (f' as {self.session.address}' if self.session.guest else '') +
-                     (' (microphone muted)' if self.session.audio_muted else ''))
+                     (' (microphone muted)' if self.session.audio_muted else '') +
+                     (' (stereo room)' if self.session.stereo_room else ' (not a stereo room: its SIP participants are heard in mono)' if self.stereo else ''))
             for label, source in self.cameras:
                 self.add_camera(label, source)
             if self.arguments.invite and not getattr(self, '_invited', False):
@@ -288,6 +387,12 @@ class SylkConference(object):
                 self._auto_disconnect = reactor.callLater(self.arguments.auto_disconnect, self._auto_leave)
         elif state == 'terminated':
             self.statistics.ended()
+            if self.listen_only and not self._established and not self.stopping:
+                # the server did not take an offer that sends nothing: our audio as muted silence, as before
+                self.listen_only = False
+                log.info(f'the room did not take a listen-only join ({self.session.reason or "?"}): joining with muted silence')
+                reactor.callLater(0, self.join)
+                return
             if self.stopping or self.arguments.no_retry:
                 if not self.stopping and reactor.running:
                     reactor.stop()
@@ -379,6 +484,9 @@ class SylkConference(object):
                 print('\n'.join(f'* {line}' for line in self.audio.lines()))
             elif command in ('input', 'output', 'a', 'o'):
                 kind = 'input' if command in ('input', 'a') else 'output'
+                if kind == 'output' and self.arguments.record_audio:
+                    print('* the speakers cannot change while recording')
+                    return
                 try:
                     self.audio.select(kind, int(rest) if rest.strip() else None)
                 except ValueError as e:
@@ -419,6 +527,7 @@ def main():
     reactor.addSystemEventTrigger('before', 'shutdown', client.leave)     # SIGINT and SIGTERM stop the reactor
     reactor.callWhenRunning(client.start)
     reactor.run()
+    client.report_recordings()
 
 
 if __name__ == '__main__':

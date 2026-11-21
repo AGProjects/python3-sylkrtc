@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 
 __all__ = ['media_summary', 'offers_video', 'video_ssrc', 'chosen_video_codec', 'cvo_id', 'with_cvo', 'rtp_extension',
-           'mids', 'ice_urls', 'offered_codecs', 'has_media', 'for_sip', 'complete_answer', 'CVO_URI']
+           'mids', 'ice_urls', 'offered_codecs', 'has_media', 'for_sip', 'complete_answer', 'with_opus_stereo', 'opus_stereo', 'CVO_URI']
 
 
 CVO_URI = 'urn:3gpp:video-orientation'
@@ -273,3 +273,31 @@ def ice_urls(ice_servers):
                     credentials = '%s:%s@' % (quote(str(server['username']), safe=''), quote(str(server.get('credential', '')), safe=''))
                 turn.append('%s://%s%s%s' % (scheme, credentials, host, ('?' + query) if query else ''))
     return stun, turn
+
+
+def _opus_payloads(sdp):
+    return re.findall(r'^a=rtpmap:(\d+) opus/', sdp, re.M | re.I)
+
+
+def opus_stereo(sdp):
+    """Whether an SDP asks for stereo Opus: stereo=1 in the fmtp of an Opus payload type (RFC 7587)."""
+    for pt in _opus_payloads(sdp or ''):
+        fmtp = re.search(r'^a=fmtp:%s ([^\r\n]*)' % pt, sdp, re.M)
+        if fmtp and any(item.strip().lower() == 'stereo=1' for item in fmtp.group(1).split(';')):
+            return True
+    return False
+
+
+def with_opus_stereo(sdp):
+    """The SDP asking for stereo Opus: stereo=1;sprop-stereo=1 in the fmtp of each Opus payload type (an fmtp line
+    added when it has none). We take and send stereo; a new SylkServer room becomes stereo."""
+    eol = '\r\n' if '\r\n' in sdp else '\n'
+    for pt in _opus_payloads(sdp):
+        fmtp = re.search(r'^a=fmtp:%s ([^\r\n]*)' % pt, sdp, re.M)
+        if fmtp is None:
+            rtpmap = re.search(r'^a=rtpmap:%s [^\r\n]*' % pt, sdp, re.M)
+            sdp = sdp[:rtpmap.end()] + eol + f'a=fmtp:{pt} stereo=1;sprop-stereo=1' + sdp[rtpmap.end():]
+            continue
+        kept = [item.strip() for item in fmtp.group(1).split(';') if item.strip() and not item.strip().lower().startswith(('stereo=', 'sprop-stereo='))]
+        sdp = sdp[:fmtp.start(1)] + ';'.join(kept + ['stereo=1', 'sprop-stereo=1']) + sdp[fmtp.end(1):]
+    return sdp
