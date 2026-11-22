@@ -216,6 +216,36 @@ def audio_devices():
     return found['Audio/Source'], found['Audio/Sink']
 
 
+def _swap_sink(pipeline, old, new, name):
+    """The sink old replaced by new in the playing pipeline, between two buffers of what feeds it."""
+    if new.find_property('async') is not None:
+        new.set_property('async', False)        # no preroll to wait for in a playing pipeline
+    old_pad = old.get_static_pad('sink')
+    upstream = old_pad.get_peer()
+    if upstream is None:
+        raise RuntimeError(f'the {name} are not linked')
+
+    def retire():
+        # another thread: stopping an audio sink from the thread that feeds it can block it for good (macOS)
+        old.set_state(Gst.State.NULL)
+        # the latency told anew: a sink added to a live pipeline does not have it, takes every buffer as late
+        # and plays nothing
+        pipeline.recalculate_latency()
+
+    def idle(pad, info):
+        # the thread that pushes to the speakers, between buffers (or right now): relinked, nothing stopped here
+        pad.unlink(old_pad)
+        pipeline.remove(old)            # still running, out of the way (the new ones take its name), stopped in retire
+        pipeline.add(new)
+        result = pad.link(new.get_static_pad('sink'))
+        if result != Gst.PadLinkReturn.OK:
+            log.warning(f'the new {name}: cannot link them ({result.value_nick})')
+        new.sync_state_with_parent()
+        threading.Thread(target=retire, name='retire-' + name, daemon=True).start()
+        return Gst.PadProbeReturn.REMOVE
+    upstream.add_probe(Gst.PadProbeType.IDLE, idle)
+
+
 def _replace_audio(media, kind, description):
     """Use other speakers (kind output) or another microphone (input) in media's pipeline, running or not:
     description is auto, none, a GStreamer description or an AudioDevice."""
@@ -236,32 +266,10 @@ def _replace_audio(media, kind, description):
     if channels is not None:
         channels.set_property('caps', _source_caps(description))      # a mono device mono, a stereo one as it is
     if sink:
-        if new.find_property('async') is not None:
-            new.set_property('async', False)        # no preroll to wait for in a playing pipeline
-        old_pad = old.get_static_pad('sink')
-        upstream = old_pad.get_peer()
-        if upstream is None:
-            raise RuntimeError(f'the {name} are not linked')
-
-        def retire():
-            # another thread: stopping an audio sink from the thread that feeds it can block it for good (macOS)
-            old.set_state(Gst.State.NULL)
-            # the latency told anew: a sink added to a live pipeline does not have it, takes every buffer as late
-            # and plays nothing
-            pipeline.recalculate_latency()
-
-        def idle(pad, info):
-            # the thread that pushes to the speakers, between buffers (or right now): relinked, nothing stopped here
-            pad.unlink(old_pad)
-            pipeline.remove(old)            # still running, out of the way (the new ones take its name), stopped in retire
-            pipeline.add(new)
-            result = pad.link(new.get_static_pad('sink'))
-            if result != Gst.PadLinkReturn.OK:
-                log.warning(f'the new speakers: cannot link them ({result.value_nick})')
-            new.sync_state_with_parent()
-            threading.Thread(target=retire, name='retire-speakers', daemon=True).start()
-            return Gst.PadProbeReturn.REMOVE
-        upstream.add_probe(Gst.PadProbeType.IDLE, idle)
+        _swap_sink(pipeline, old, new, name)
+        monitor = pipeline.get_by_name('monitorspeakers')
+        if monitor is not None:
+            _swap_sink(pipeline, monitor, RoomMedia._audio_element(media, description, 'monitorspeakers', sink=True), 'monitorspeakers')
     else:
         old_pad = old.get_static_pad('src')
         downstream = old_pad.get_peer()
@@ -512,6 +520,14 @@ def _monitor_head(media):
     media._monitor_mixer, media._monitor_tees, media._monitors = None, {}, {}
     media.__dict__.setdefault('monitor_on', {})
     if not getattr(media, 'monitor', False) or media.audio_output == 'none':
+        return []
+    if getattr(media, '_mixer', None) is not None:
+        # a room: what we hear of ourselves goes to the same device by a sink of its own (the system mixes them).
+        # Mixed with the room's feeds, in the room's mixer or a mixer after it, the latency cannot be configured
+        # with their jitter buffers, and the feeds stall
+        media._monitor_mixer = _make('audiomixer', 'monitormixer', latency=40 * Gst.MSECOND, ignore_inactive_pads=True)
+        sink = RoomMedia._audio_element(media, media.audio_output, 'monitorspeakers', sink=True)
+        _link_chain(media.pipeline, [media._monitor_mixer, _make('audioconvert'), _make('audioresample'), sink])
         return []
     media._monitor_mixer = _make('audiomixer', 'monitormixer', latency=40 * Gst.MSECOND, ignore_inactive_pads=True)
     return [_make('audioconvert'), _make('audioresample'), _make('capsfilter', caps=Gst.Caps.from_string(MONITOR_CAPS)),
@@ -1408,11 +1424,16 @@ class RoomMedia(_Strips):
         media, participant.media = participant.media, None
         if media is None or self.pipeline is None:
             return
-        for element in reversed(media['elements']):
-            element.set_state(Gst.State.NULL)
-            self.pipeline.remove(element)
-        for pad in media['mixer_pads']:
-            self._mixer.release_request_pad(pad)
+        pipeline, mixer = self.pipeline, self._mixer
+
+        def teardown():
+            # another thread: a branch whose thread is stuck would block the one stopping it (the reactor: no keys)
+            for element in reversed(media['elements']):
+                element.set_state(Gst.State.NULL)
+                pipeline.remove(element)
+            for pad in media['mixer_pads']:
+                mixer.release_request_pad(pad)
+        threading.Thread(target=teardown, name='remove-feed', daemon=True).start()
 
     # Statistics
 
