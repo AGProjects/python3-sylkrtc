@@ -499,9 +499,9 @@ def _send_audio(media, echo_cancellation, muted):
         log.warning(f'--playback: no audio files in {", ".join(media.playback)}: the microphone alone')
     if not files:
         media.send_mixer = None
-        return microphone + _level('miclevel') + _monitor_tee(media, 'mic')
+        return microphone + _level('miclevel') + _monitor_tee(media, 'mic') + [_make('tee', 'rec-sent', allow_not_linked=True)]
     media.send_mixer = SendMixer(media, files)
-    return media.send_mixer.head(microphone)
+    return media.send_mixer.head(microphone) + [_make('tee', 'rec-sent', allow_not_linked=True)]      # what r records of what we send
 
 
 def _attach_send_audio(media):
@@ -1048,7 +1048,103 @@ class _Strips(object):
         return volume
 
 
-class RoomMedia(_Strips):
+RECORD_BITRATE = 128000     # bit/s of a recording (Opus in Ogg, stereo)
+
+
+class _Recorder(object):
+    """r: what we hear and what we send, mixed, recorded into an Ogg Opus file (stereo), started and stopped while
+    the media runs: from the tees rec-heard (before the speakers) and rec-sent (before the encoder).
+
+        rec-heard -> queue -> convert/resample --\
+        rec-sent  -> queue -> convert/resample ---> audiomixer -> convert -> opusenc -> oggmux -> filesink
+    """
+
+    _recording = None
+
+    @property
+    def recording(self):
+        """The path of the file being recorded, None."""
+        return self._recording['path'] if self._recording is not None else None
+
+    def start_recording(self, path, tracks=None):
+        """What we hear and what we send into path; with tracks (a folder, a room's media), each participant's
+        track and ours into it too, for as long."""
+        pipeline = self.pipeline
+        if pipeline is None or self._recording is not None:
+            return False
+        tees = [tee for tee in (pipeline.get_by_name('rec-heard'), pipeline.get_by_name('rec-sent')) if tee is not None]
+        if not tees:
+            raise RuntimeError('nothing to record')
+        caps = Gst.Caps.from_string('audio/x-raw,rate=48000,channels=2')
+        mixer = _make('audiomixer', None, latency=40 * Gst.MSECOND, ignore_inactive_pads=True)
+        tail = [mixer, _make('audioconvert'), _make('capsfilter', caps=caps),
+                _make('opusenc', bitrate=RECORD_BITRATE, audio_type='generic'), _make('oggmux'),
+                _make('filesink', location=path, sync=False)]
+        tail[-1].set_property('async', False)
+        _link_chain(pipeline, tail)
+        branches = []
+        for tee in tees:
+            # each queue as big as what is heard of the room can be late (else the mixer cannot configure its latency)
+            branch = [_make('queue', max_size_time=3 * Gst.SECOND, max_size_buffers=0, max_size_bytes=0, leaky='downstream'),
+                      _make('audioconvert'), _make('audioresample'), _make('capsfilter', caps=caps)]
+            _link_chain(pipeline, branch)
+            _link_into(branch[-1], mixer)
+            branches.append((tee, branch))
+        for element in tail + [element for tee, branch in branches for element in branch]:
+            element.sync_state_with_parent()
+        for index, (tee, branch) in enumerate(branches):
+            pad = tee.request_pad_simple('src_%u')
+            pad.link(branch[0].get_static_pad('sink'))
+            branches[index] = (tee, branch, pad)
+        self._recording = dict(path=path, tail=tail, branches=branches, done=threading.Event())
+        pipeline.recalculate_latency()
+        log.info(f'recording to {path}')
+        if tracks and hasattr(self, 'start_tracks'):
+            os.makedirs(tracks, mode=0o700, exist_ok=True)
+            self.start_tracks(tracks)
+        return True
+
+    def stop_recording(self, wait=0.0):
+        """The file closed (an end of stream through it, so Ogg writes its last page); wait: s to wait for it."""
+        recording, self._recording = self._recording, None
+        pipeline = self.pipeline
+        if recording is None or pipeline is None:
+            return None
+        if getattr(self, 'record_tracks', None) and hasattr(self, 'stop_tracks'):
+            self.stop_tracks()
+        elements = recording['tail'] + [element for tee, branch, pad in recording['branches'] for element in branch]
+
+        def teardown():
+            for tee, branch, pad in recording['branches']:
+                tee.release_request_pad(pad)
+            for element in elements:
+                element.set_state(Gst.State.NULL)
+                if element.get_parent() is pipeline:
+                    pipeline.remove(element)
+            log.info(f'recorded {recording["path"]}')
+
+        def on_event(pad, info):
+            event = info.get_event()
+            if event is not None and event.type == Gst.EventType.EOS:
+                recording['done'].set()
+                threading.Thread(target=teardown, name='recording-done', daemon=True).start()
+            return Gst.PadProbeReturn.OK
+        recording['tail'][-1].get_static_pad('sink').add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, on_event)
+
+        for tee, branch, pad in recording['branches']:
+            def idle(tee_pad, info, branch=branch):
+                # the tee's thread, between buffers: no more into the branch, its end of stream instead
+                sink = branch[0].get_static_pad('sink')
+                tee_pad.unlink(sink)
+                sink.send_event(Gst.Event.new_eos())
+                return Gst.PadProbeReturn.REMOVE
+            pad.add_probe(Gst.PadProbeType.IDLE, idle)
+        if wait:
+            recording['done'].wait(wait)
+        return recording['path']
+
+
+class RoomMedia(_Strips, _Recorder):
     """video_source: our own video (session.video), as an extra video's source: dict(kind='v4l2', device, resolution, fps)
     or dict(kind='test', pattern, resolution, fps); the extra videos are shown under it."""
 
@@ -1093,9 +1189,15 @@ class RoomMedia(_Strips):
         playback = [self._mixer] + ([_stereo_caps()] if self.stereo else []) + [_make('audioconvert'), _make('audioresample')]
         if echo_cancellation:
             playback.append(_make('webrtcechoprobe', 'echoprobe'))
-        playback += _monitor_head(self)
+        playback += _monitor_head(self) + [_make('tee', 'rec-heard', allow_not_linked=True)]     # what r records of what we hear
         playback.append(self._audio_element(self.audio_output, 'speakers', sink=True))
         _link_chain(self.pipeline, playback)
+        # silence, live, into the mixer from the start: with no one in the room yet it has no input, the pipeline's
+        # latency cannot be told and nothing is played (what we hear of ourselves neither) until a feed comes
+        silence = [_make('audiotestsrc', 'roomsilence', wave='silence', is_live=True),
+                   _make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,rate=48000,channels=2'))]
+        _link_chain(self.pipeline, silence)
+        _link_into(silence[-1], self._mixer)
 
         self.publisher = webrtcbin = _make('webrtcbin', 'publisher', bundle_policy='max-bundle')
         _configure_ice(webrtcbin, self.session.ice_servers)
@@ -1192,6 +1294,8 @@ class RoomMedia(_Strips):
         _replace_audio(self, kind, description)
 
     def stop(self):
+        if self._recording is not None:
+            self.stop_recording(wait=1.0)
         if self.pipeline is not None:
             pipeline, self.pipeline = self.pipeline, None
             pipeline.set_state(Gst.State.NULL)
@@ -1304,9 +1408,9 @@ class RoomMedia(_Strips):
             chain = [_make('queue', max_size_buffers=0, max_size_bytes=0, max_size_time=RECEIVED_AUDIO_QUEUE * Gst.SECOND, leaky='downstream'), _make('audioconvert'), _make('audioresample'),
                      _make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,rate=48000,channels=2'))]
             participant.media['channels'] = _channels(caps)     # 1: a mono participant, 2: a stereo one
-            tee = _make('tee') if self.record_tracks else None
-            if tee is not None:         # its own file too (record_tracks), from the tee
-                chain += [tee, _make('queue')]
+            tee = _make('tee', allow_not_linked=True)      # its own track (record_tracks), from here, whenever recorded
+            chain += [tee, _make('queue')]
+            participant.media['tee'] = tee
             chain.append(self._listen_volume(participant.name, 'listen-' + participant.feed))
             if _has('level'):
                 chain.append(_make('level', 'level-' + participant.feed, interval=LEVEL_INTERVAL, post_messages=True))
@@ -1322,7 +1426,7 @@ class RoomMedia(_Strips):
             mixer_pad = self._mixer.request_pad_simple('sink_%u')
             chain[-1].get_static_pad('src').link(mixer_pad)
             participant.media['mixer_pads'].append(mixer_pad)
-            if tee is not None:
+            if self.record_tracks:          # recorded now: from its start
                 try:
                     self._record_track(participant, tee)
                 except Exception as e:
@@ -1416,6 +1520,30 @@ class RoomMedia(_Strips):
         """Leaving: every track's file closed (before the pipeline is stopped)."""
         for track in list(self._tracks):
             self._end_track(track, later=False)
+
+    def start_tracks(self, folder):
+        """Each participant's track, and ours (what we send), into folder, from now on: aligned, each from now (or
+        from when one comes)."""
+        self.record_tracks = folder
+        self._tracks_origin = time.monotonic()
+        for participant in list(self.session.feeds.values()):
+            tee = (participant.media or {}).get('tee')
+            if tee is not None:
+                try:
+                    self._record_track(participant, tee)
+                except Exception as e:
+                    log.warning(f'{self.session.room}: cannot record {participant.name} on a track of its own: {e}')
+        sent = self.pipeline.get_by_name('rec-sent') if self.pipeline is not None else None
+        if sent is not None:
+            import types
+            name = getattr(getattr(self.session, 'identity', None), 'display_name', None) or getattr(self.session, 'address', None) or 'us'
+            self._record_track(types.SimpleNamespace(name=f'{name} (sent)', uri='', media={}), sent)
+
+    def stop_tracks(self):
+        """The tracks closed (their files whole): none recorded until start_tracks again."""
+        self.record_tracks = None
+        for track in list(self._tracks):
+            self._end_track(track)
 
     def _listen(self):
         return [(participant.name, participant.name) for participant in list(self.session.feeds.values()) if participant.media]
@@ -1710,7 +1838,7 @@ class VideoFrame(object):
         self.data = data
 
 
-class CallMedia(_Strips):
+class CallMedia(_Strips, _Recorder):
     """The media of a 1 to 1 call: one webrtcbin carrying audio and video both ways.
 
         microphone -> [webrtcdsp] -> volume (mute) -> opusenc -> rtpopuspay ------------> webrtcbin
@@ -1779,7 +1907,7 @@ class CallMedia(_Strips):
         playback = [_make('audioconvert', 'playback'), _make('audioresample')]
         if echo_cancellation:
             playback.append(_make('webrtcechoprobe', 'echoprobe'))
-        playback += _monitor_head(self)
+        playback += _monitor_head(self) + [_make('tee', 'rec-heard', allow_not_linked=True)]     # what r records of what we hear
         playback.append(RoomMedia._audio_element(self, self.audio_output, 'speakers', sink=True))
         _link_chain(self.pipeline, playback)
         self._playback = playback[0]
@@ -2082,6 +2210,8 @@ class CallMedia(_Strips):
         _replace_audio(self, kind, description)
 
     def stop(self):
+        if self._recording is not None:
+            self.stop_recording(wait=1.0)
         if self.pipeline is not None:
             pipeline, self.pipeline = self.pipeline, None
             pipeline.get_bus().set_sync_handler(None, None)

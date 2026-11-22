@@ -547,7 +547,8 @@ def meter_panel(height, width, title, groups, info=(), footer=''):
     SPACER: the room left, shared between the spacers), the groups' names and every meter's value under them, the
     info lines, the footer."""
     info = list(info)
-    rows = height - 4 - len(info)
+    captions = any(isinstance(group, tuple) and len(group) > 3 and group[3] for group in groups)
+    rows = height - 4 - len(info) - (1 if captions else 0)      # a line over the meters for the captions (PAUSED)
     while rows < 4 and info:
         info.pop()
         rows += 1
@@ -571,7 +572,7 @@ def meter_panel(height, width, title, groups, info=(), footer=''):
             name, meters = group[0], group[1]
             columns = [_cells(meter, rows) for meter in meters]
             group_width = max(len(name) + 2, SLOT * len(columns) + 1)
-            built.append(('group', name, columns, group_width, len(group) > 2 and group[2]))
+            built.append(('group', name, columns, group_width, len(group) > 2 and group[2], group[3] if len(group) > 3 else None))
             fixed += group_width
     room = max(0, width - 1 - fixed)
     shares = [room // spacers + (1 if index < room % spacers else 0) for index in range(spacers)] if spacers else []
@@ -598,10 +599,19 @@ def meter_panel(height, width, title, groups, info=(), footer=''):
             return ' ' + ''.join(cells[row] + ' ' * (SLOT - 3) for cells, text in columns) + ' ' * (group_width - 1 - SLOT * len(columns))
         return line(part)
 
+    def caption_part(kind, entry):
+        if kind == 'scale':
+            return ' ' * 5
+        name, columns, group_width, style, caption = entry[1:]
+        meters = SLOT * len(columns)
+        # over its meters exactly: from the first column's bar to the last's
+        text = _center(caption or '', meters - 2)
+        return ' ' + (RED + BOLD + text + RESET if caption else text) + ' ' * (group_width - 1 - (meters - 2))
+
     def name_part(kind, entry):
         if kind == 'scale':
             return ' ' * 5
-        name, columns, group_width, style = entry[1:]
+        name, columns, group_width, style = entry[1:5]
         if style == 'muted':        # in red, the same width: nothing moves
             return RED + BOLD + _center(name, group_width) + RESET
         if style:
@@ -615,7 +625,8 @@ def meter_panel(height, width, title, groups, info=(), footer=''):
         name, columns, group_width = entry[1:4]
         return ' ' + ''.join(_center(text, SLOT - 1) + ' ' for cells, text in columns) + ' ' * (group_width - 1 - SLOT * len(columns))
 
-    return [title] + [meter_row(row) for row in range(rows)] + [line(name_part), line(value_part)] + info + [footer]
+    return ([title] + ([line(caption_part)] if captions else []) + [meter_row(row) for row in range(rows)]
+            + [line(name_part), line(value_part)] + info + [footer])
 
 
 class MixerControl(object):
@@ -802,8 +813,9 @@ class StatusPanel(object):
     """A panel fixed at the top of the terminal (its first height lines), the console scrolling under it: an ANSI
     scroll region (DECSTBM), so print and the log go on as before. Only on a terminal; update(lines) redraws it."""
 
-    def __init__(self, height=None, fraction=None, minimum=8):
+    def __init__(self, height=None, fraction=None, minimum=8, reserve=None):
         self.fixed_height, self.fraction, self.minimum = height, fraction, minimum
+        self.reserve = reserve      # the lines left under the panel (else fraction of the terminal is the panel)
         self.height = height or minimum
         self.columns = 80
         self.active = False
@@ -834,8 +846,8 @@ class StatusPanel(object):
     def _setup(self, first=False):
         import shutil
         columns, rows = shutil.get_terminal_size((80, 24))
-        height = self.fixed_height or max(self.minimum, int(rows * self.fraction))
-        height = min(height, rows - 4)          # the console keeps 4 lines at least
+        height = self.fixed_height or (rows - self.reserve if self.reserve else max(self.minimum, int(rows * self.fraction)))
+        height = min(height, rows - (self.reserve or 4))     # the console keeps 4 lines at least (or reserve)
         if height < self.minimum:
             return False
         self.height = height
@@ -1239,7 +1251,12 @@ class _Tee(object):
         self.stream = stream
         self.log_file = log_file
 
+    muted = False       # True: to the log file only (--no-logs: the log lines, for tail -f in another terminal)
+
     def write(self, text):
+        if self.muted:
+            self.log_file.record(text, self)
+            return len(text)
         # the terminal can be non-blocking (Twisted's stdio sets it for stdin, which shares it): wait instead of losing
         # what does not fit at once (a long SDP)
         rest = text
@@ -1282,6 +1299,10 @@ class LogFile(object):
         self.file = None
         self.starts = {}        # stream -> at the start of a line
 
+    @property
+    def path(self):
+        return os.path.join(self.folder, f'{self.name}-{time.strftime("%Y-%m-%d")}.log')
+
     def _open(self):
         day = time.strftime('%Y-%m-%d')
         if day != self.day:
@@ -1319,6 +1340,12 @@ def start_log_file(name):
             handler.setStream(originals[handler.stream])
     sys.stdout, sys.stderr = originals[sys.stdout], originals[sys.stderr]
     return log_file
+
+
+def mute_log_lines():
+    """--no-logs: the log lines (stderr, where the log handlers write) to the log file only; what is printed stays."""
+    if isinstance(sys.stderr, _Tee):
+        sys.stderr.muted = True
 
 
 def setup_logging(arguments):
