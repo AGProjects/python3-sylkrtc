@@ -567,7 +567,8 @@ class SylkCall(object):
         connection = getattr(call, 'connection', None) if call is not None else None
         server_rtt = connection.rtt * 1000 if connection is not None and getattr(connection, 'rtt', None) is not None else None
         network = network_lines(rtt, loss_out, loss_in, jitter_out, jitter_in, jitter=self.arguments.jitter, width=self.SIDEBAR_WIDTH - 26,
-                                late_in=late_in, totals=totals, server_rtt=server_rtt)
+                                late_in=late_in, totals=totals, server_rtt=server_rtt,
+                                rate_out=value(out, 'rate'), rate_in=value(incoming, 'rate'))
         groups = [SCALE]
         # ours: the microphone (with --playback: the microphone, the music, then the total, all we send); then the far end
         media = call.media if call is not None and call.state not in ('idle', 'terminated') else None

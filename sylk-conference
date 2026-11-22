@@ -576,7 +576,9 @@ class SylkConference(object):
         connection = getattr(session, 'connection', None) if session is not None else None
         server_rtt = connection.rtt * 1000 if connection is not None and getattr(connection, 'rtt', None) is not None else None
         network = network_lines(rtt, loss_out, loss_in, jitter_out, jitter_in, jitter=self.arguments.jitter, width=self.SIDEBAR_WIDTH - 26,
-                                late_in=max(lates) if lates else None, totals=totals, server_rtt=server_rtt)
+                                late_in=max(lates) if lates else None, totals=totals, server_rtt=server_rtt,
+                                rate_out=out['rate'] if out is not None else None,
+                                rate_in=sum(row['rate'] for row in incoming if row['rate'] is not None) if any(row['rate'] is not None for row in incoming) else None)
         groups = [SCALE]
         # ours: the microphone (with --playback: the microphone, the music, then the total, all we send); then the participants
         media = session.media if session is not None and session.media is not None and session.state == 'established' else None

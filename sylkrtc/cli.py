@@ -740,8 +740,18 @@ class MixerControl(object):
                 + (f'  {YELLOW}{BOLD}PAUSED{RESET}' if getattr(mixer, 'paused', False) else ''))
 
 
+BANDWIDTH_FULL = 512000     # bit/s at which the panel's bandwidth bars are full (more: full, the number says it)
+
+
+def short_rate(bits_per_second):
+    """'128 kb/s', '1.2 Mb/s': a rate in 8 characters."""
+    if bits_per_second >= 1000000:
+        return f'{bits_per_second / 1000000:.1f} Mb/s'
+    return f'{bits_per_second / 1000:.0f} kb/s'
+
+
 def network_lines(rtt, loss_out, loss_in, jitter_out=None, jitter_in=None, jitter=False, width=12, late_in=None, totals=None,
-                  server_rtt=None):
+                  server_rtt=None, rate_out=None, rate_in=None):
     """The panel's lines of the network (on the left, over the devices): round trip time (ms), loss (%) of what we
     send (the far end's report) and of what we get, the packets that came too late for the jitter buffer (%: heard
     as gaps, not loss) - those the worst of the last Statistics.HOLD s, and totals ({name: packets since the start})
@@ -758,7 +768,10 @@ def network_lines(rtt, loss_out, loss_in, jitter_out=None, jitter_in=None, jitte
              line('rtt srv', server_rtt, 500, 150, 300, f'{server_rtt:.0f} ms'),
              line('loss ↑', loss_out, 10, 1, 5, f'{loss_out:.1f}%' if loss_out is not None else '', 'lost_out'),
              line('loss ↓', loss_in, 10, 1, 5, f'{loss_in:.1f}%' if loss_in is not None else '', 'lost_in'),
-             line('late ↓', late_in, 10, 1, 5, f'{late_in:.1f}%' if late_in is not None else '', 'late_in')]
+             line('late ↓', late_in, 10, 1, 5, f'{late_in:.1f}%' if late_in is not None else '', 'late_in'),
+             # the bandwidth: no colour of warning, much of it is no fault
+             line('band ↑', rate_out, BANDWIDTH_FULL, float('inf'), float('inf'), short_rate(rate_out) if rate_out is not None else ''),
+             line('band ↓', rate_in, BANDWIDTH_FULL, float('inf'), float('inf'), short_rate(rate_in) if rate_in is not None else '')]
     if jitter:
         lines += [line('jitter ↑', jitter_out, 100, 30, 60, f'{jitter_out:.0f} ms' if jitter_out is not None else ''),
                   line('jitter ↓', jitter_in, 100, 30, 60, f'{jitter_in:.0f} ms' if jitter_in is not None else '')]
