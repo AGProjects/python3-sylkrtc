@@ -679,9 +679,11 @@ class VideoroomSession(object):
 
         def attached(error):
             if error is not None:
+                self.log(f'cannot subscribe to {participant.name}: {error}', 'warning')
                 participant.state = 'failed'
                 participant._changed()
 
+        self.log(f'subscribing to {participant.name} (publisher {participant.id}, feed {participant.feed[:8]})')
         self.connection.request(dict(sylkrtc='videoroom-feed-attach', session=self.id, publisher=participant.id, feed=participant.feed), attached)
 
     def _send_feed_answer(self, participant, sdp):
@@ -689,6 +691,7 @@ class VideoroomSession(object):
             return
         codec = chosen_video_codec(sdp)
         participant.video_codec = codec[0] if codec else None
+        self.log(f'answering {participant.name}: {media_summary(sdp)}')
         self.connection.request(dict(sylkrtc='videoroom-feed-answer', session=self.id, feed=participant.feed, sdp=sdp))
         self._flush_trickle(participant.feed)
         if self.video_paused:

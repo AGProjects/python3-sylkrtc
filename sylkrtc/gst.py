@@ -528,7 +528,9 @@ def _monitor_tee(media, key):
 
 
 def _attach_monitor(media, key, tee):
-    branch = [_make('queue', max_size_time=200 * Gst.MSECOND, max_size_buffers=0, max_size_bytes=0, leaky='downstream'),
+    # its queue's size is its most latency: more than what is heard of the room brings (its jitter buffer, the room's
+    # mixer: 210 ms and up), else the monitor mixer cannot configure its latency and stops (leaky: never held back)
+    branch = [_make('queue', max_size_time=3 * Gst.SECOND, max_size_buffers=0, max_size_bytes=0, leaky='downstream'),
               _make('audioconvert'), _make('audioresample'), _make('capsfilter', caps=Gst.Caps.from_string(MONITOR_CAPS)),
               _make('volume', 'monitor-' + key, mute=not media.monitor_on.get(key, False))]
     _link_chain(media.pipeline, branch)
@@ -1092,6 +1094,11 @@ class RoomMedia(_Strips):
         microphone.append(_make('capsfilter', caps=audio_caps))
         _link_chain(self.pipeline, microphone)
         _attach_send_audio(self)
+
+        def first(pad, info):
+            log.info(f'{self.session.room}: our first audio packet to the room')
+            return Gst.PadProbeReturn.REMOVE
+        microphone[-1].get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER, first)
         audio_pad = webrtcbin.request_pad_simple('sink_%u')
         transceiver = audio_pad.get_property('transceiver')
         # listening only (session.listen_only: a recorder): offered inactive, nothing of ours sent
@@ -1250,6 +1257,8 @@ class RoomMedia(_Strips):
             return
         caps = pad.get_current_caps() or pad.query_caps(None)
         media = caps.get_structure(0).get_string('media') if caps is not None and caps.get_size() else None
+        encoding = caps.get_structure(0).get_string('encoding-name') if caps is not None and caps.get_size() else None
+        log.info(f'{participant.name}: {media or "?"} arrives ({encoding or "?"})' + (': not decoded (not shown)' if media == 'video' and self.video_sink is None else ''))
         if media == 'video' and self.video_sink is None:
             self._discard(participant, pad)     # nobody looks at it: not even decoded
             return
@@ -1281,6 +1290,14 @@ class RoomMedia(_Strips):
             chain.append(self._listen_volume(participant.name, 'listen-' + participant.feed))
             if _has('level'):
                 chain.append(_make('level', 'level-' + participant.feed, interval=LEVEL_INTERVAL, post_messages=True))
+            structure = caps.get_structure(0) if caps is not None and caps.get_size() else None
+            rate = structure.get_value('rate') if structure is not None and structure.has_field('rate') else None
+            log.info(f'{participant.name}: audio decoded ({participant.media["channels"] or "?"} channel(s), {rate or "?"} Hz): to the mixer')
+
+            def first(pad, info):
+                log.info(f'{participant.name}: first audio to the mixer')
+                return Gst.PadProbeReturn.REMOVE
+            chain[-1].get_static_pad('src').add_probe(Gst.PadProbeType.BUFFER, first)
             self._add_branch(participant, chain, pad)
             mixer_pad = self._mixer.request_pad_simple('sink_%u')
             chain[-1].get_static_pad('src').link(mixer_pad)
