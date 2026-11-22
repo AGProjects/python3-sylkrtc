@@ -14,7 +14,7 @@ Everything runs in the twisted reactor thread; the results are posted with the
 NotificationCenter of python3-application. Logging goes to the 'sylkrtc' logger.
 """
 
-__version__ = '1.0.0'
+__version__ = '1.1.0'
 
 PROTOCOL = 'sylkRTC-2'
 

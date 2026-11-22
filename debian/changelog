@@ -1,3 +1,16 @@
+python3-sylkrtc (1.1.0) unstable; urgency=medium
+
+  * Added sylk-account, sylk-addressbook, sylk-journal and sylk-settings tools
+  * Added stereo audio to sylk-conference and sylk-session
+  * Added music playback mixed with the microphone (--playback)
+  * Added audio recording of conferences, mixed or per track
+  * Added RTSP and ONVIF cameras as conference video sources
+  * Added auto-answer, auto-reconnect and auto-disconnect options
+  * Added headless mode and audio level and statistics output
+  * Bug fixes
+
+ -- Adrian Georgescu <ag@ag-projects.com>  Sun, 22 Nov 2026 10:24:00 -0300
+
 python3-sylkrtc (1.0.0) unstable; urgency=medium
 
   * Initial release: SylkServer discovery, sylkRTC connection, video rooms
