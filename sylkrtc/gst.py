@@ -392,11 +392,14 @@ def _opus_encoder(stereo):
     return _make('opusenc', bitrate=32000, inband_fec=True, audio_type='voice')
 
 
-def _opus_caps(pt, stereo):
-    """The caps of our Opus RTP, stereo=1;sprop-stereo=1 when stereo (webrtcbin puts them in the fmtp)."""
+def _opus_caps(pt, stereo, ssrc=None):
+    """The caps of our Opus RTP, stereo=1;sprop-stereo=1 when stereo (webrtcbin puts them in the fmtp); with ssrc,
+    the offer announces it (a=ssrc), as browsers do: a room forwards to the others a stream it knows by it."""
     caps = f'application/x-rtp,media=audio,encoding-name=OPUS,payload={pt},clock-rate=48000,encoding-params=(string)2'
     if stereo:
         caps += ',stereo=(string)1,sprop-stereo=(string)1'
+    if ssrc is not None:
+        caps += f',ssrc=(uint){ssrc}'
     return Gst.Caps.from_string(caps)
 
 
@@ -1064,6 +1067,7 @@ class RoomMedia(_Strips):
         self._volume = None
         self._video_pad = None
         self._video_ssrc = random.randint(1, 0xffffffff)
+        self._audio_ssrc = random.randint(1, 0xffffffff)
         self._levels = _Levels()
         self.record_tracks = None       # a folder (MediaFactory): a FLAC per participant, see _record_track
         self.track_paths = None
@@ -1099,12 +1103,12 @@ class RoomMedia(_Strips):
         self._watch_webrtcbin(webrtcbin, self.session.id)
 
         microphone = _send_audio(self, echo_cancellation, self.session.audio_muted)
-        payloader = _make('rtpopuspay', pt=OPUS_PT)
+        payloader = _make('rtpopuspay', pt=OPUS_PT, ssrc=self._audio_ssrc)
         microphone += _audio_level_meter() + [
                        _make('queue', max_size_time=200 * Gst.MSECOND, leaky='downstream'),
                        _opus_encoder(self.stereo),
                        payloader]
-        audio_caps = _add_audio_level_extension(payloader, _opus_caps(OPUS_PT, self.stereo))
+        audio_caps = _add_audio_level_extension(payloader, _opus_caps(OPUS_PT, self.stereo, self._audio_ssrc))
         if audio_caps.get_structure(0).has_field('extmap-%d' % SSRC_AUDIO_LEVEL_ID):
             log.info('our audio carries its level (ssrc-audio-level, RFC 6464): the room shows when we talk')
         microphone.append(_make('capsfilter', caps=audio_caps))
@@ -1749,6 +1753,7 @@ class CallMedia(_Strips):
         self._volume = None
         self._video_pad = None
         self._video_ssrc = random.randint(1, 0xffffffff)
+        self._audio_ssrc = random.randint(1, 0xffffffff)
         self._levels = _Levels()
         self._remote_size = None
         self._camera_linked = False
