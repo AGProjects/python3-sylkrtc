@@ -119,6 +119,10 @@ def parse_arguments():
                                                                   'what it supports and whether it takes the account')
     parser.add_argument('--stats-interval', type=float, default=60, metavar='SECONDS',
                         help='log the bandwidth, round trip time and loss of every stream this often (default %(default)g, 0: never); a summary is logged on leaving')
+    parser.add_argument('--rtp-log', action='store_true',
+                        help='log every 2 s each stream\'s RTP statistics from the start (r does it by hand): packets per second '
+                             'sent and received, loss, late packets (gaps), jitter and round trip time, with millisecond '
+                             'timestamps, to set beside the other end\'s log (Blink\'s "audio over the last 2 s" lines)')
     parser.add_argument('--auto-disconnect', type=float, default=None, metavar='SECONDS',
                         help='leave the room and exit this many seconds after first getting in (default 600, 10 minutes; '
                              'with --record-audio 0; 0: stay)')
@@ -228,6 +232,7 @@ class SylkConference(object):
         self.attempt = 0
         self.stopping = False
         self.statistics = Statistics(arguments.stats_interval)
+        self.statistics.live_on_start = getattr(arguments, 'rtp_log', False)     # --rtp-log: the r lines from the start
         self.mixer_control = MixerControl(hidden=() if arguments.total_out_level else [('send', 'total')])      # the console mixer
         self.console = None
         self.audio = AudioChoice(self.audio_input, self.audio_output)

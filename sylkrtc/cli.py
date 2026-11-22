@@ -935,10 +935,14 @@ class Statistics(object):
         self.strip_levels = {}      # the send mixer's strip name -> its level, of the latest measure
         self._ticker = None
 
+    live_on_start = False       # --rtp-log: the live lines (toggle_live) from the first connection, headless too
+
     def start(self, session):
         """A connection is established."""
         from sylkrtc.util import RepeatingTimer
         self.session = session
+        if self.live_on_start and not self.live:
+            self.toggle_live()
         self.samples, self.logged = {}, {}
         if self.started is None:
             self.started = reactor.seconds()
@@ -1350,7 +1354,8 @@ def mute_log_lines():
 
 def setup_logging(arguments):
     level = logging.DEBUG if arguments.debug else logging.INFO
-    logging.basicConfig(level=level, format='%(asctime)s %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    # milliseconds: a log set beside another end's (--rtp-log against Blink's) lines up to the 2 s window
+    logging.basicConfig(level=level, format='%(asctime)s.%(msecs)03d %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
     if (getattr(arguments, 'discover', False) or getattr(arguments, 'server_info', False)) and not arguments.debug:
         level = logging.WARNING     # a report: what it prints, warnings and errors only
         logging.getLogger().setLevel(level)
