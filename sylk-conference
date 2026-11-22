@@ -513,6 +513,21 @@ class SylkConference(object):
             return
         self._start_recording(media)
 
+    def _toggle_channel(self, media, channel):
+        """[ ]: the selected strip's left or right channel off in what we send (in stereo), or on again."""
+        strip = self.mixer_control.selected_strip(media) if media is not None else None
+        if strip is None or not hasattr(media, 'toggle_strip_channel'):
+            print('* select a strip (← →) to turn its left ([) or right (]) channel off')
+            return
+        # ours: in what we send; one of what we hear: in what we hear of it
+        on = media.toggle_strip_channel(strip['key'] if strip['kind'] == 'send' else 'listen:' + strip['key'], channel)
+        if on is None:
+            print('* we send mono: start with --stereo to set the channels apart')
+        else:
+            print(f'* {strip["name"]}: the {("left", "right")[channel]} channel ' + ('on' if on else 'off'))
+        if self.panel is not None:
+            self._update_panel()
+
     # The status panel: the top 65% of the terminal, the console scrolling under it
 
     PANEL_FRACTION = 0.65
@@ -603,10 +618,10 @@ class SylkConference(object):
                 level = total if strip['name'] == 'total' else self.statistics.strip_levels.get(strip['name'])
                 label, style = control.label(media, 'send', strip['name'], strip['name'], muted=strip['name'] == 'mic' and muted)
                 groups.append((label, vu_meters(level, channels), style,
-                               'PAUSED' if strip['name'] == 'music' and mixer.paused else None))     # over its meters
+                               'PAUSED' if strip['name'] == 'music' and mixer.paused else media.channels_caption(strip['name'])))     # over its meters
         else:
             label, style = control.label(media, 'send', 'mic', 'mic', muted=muted)
-            groups.append((label, vu_meters(total, channels), style))
+            groups.append((label, vu_meters(total, channels), style, media.channels_caption('mic') if media is not None else None))
         groups.append(GAP)
         if self.console is not None:
             footer = DIM + '── ← → select · ↑ ↓ volume' + (' · u pause · n b next/back' if mixer is not None else '') + ' · 0-9 level · a/space hear it · v/o devices · m mute · Enter message · / command · ? help ' + '─' * 400 + RESET
@@ -615,7 +630,8 @@ class SylkConference(object):
             row = by_name.get(participant.name)
             level = row['level'] if row is not None else None
             label, style = control.label(media, 'listen', participant.name, participant.name.partition('@')[0][:12], muted=participant.muted)
-            groups.append((label, vu_meters(level, 1), style))
+            groups.append((label, vu_meters(level, 1), style,
+                           media.channels_caption('listen:' + participant.name) if media is not None else None))
         sent = out['rate'] if out is not None and out['rate'] is not None else None
         received = sum(row['rate'] for row in incoming if row['rate'] is not None) if incoming else None
         info = [f' {BOLD}out{RESET} ' + (f'{human_rate(sent)} {human_bytes(out["bytes"])}' if sent is not None else '-')
@@ -638,6 +654,8 @@ class SylkConference(object):
     0-9    the selected one's volume: 0 off, 1 to 9 from -40 dB (barely heard) to 0 dB (full), 5 dB a step
     a, space  hear the selected one of ours here too, or not: the amplifier (--monitor or --playback; headphones)
     u      pause the music, or play it on (as m for the microphone)
+    [ ]    the selected one's left, right channel off in what we send, or on again (--stereo): talk on the left,
+           music on the right
     n b    the next file of the music, the one before
     m      mute / unmute the microphone
     v o    the next microphone, the next speakers
@@ -695,6 +713,8 @@ class SylkConference(object):
             print('* ' + self.mixer_control.toggle_monitor(session.media))
             if self.panel is not None:
                 self._update_panel()
+        elif key in '[]' and session is not None and session.media is not None:
+            self._toggle_channel(session.media, 0 if key == '[' else 1)
         elif key == 'u' and mixer is not None:
             print('* music paused' if mixer.toggle_pause() else '* music on')
         elif key in ('n', 'b') and mixer is not None:

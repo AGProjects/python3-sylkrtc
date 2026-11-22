@@ -87,6 +87,8 @@ KEYS_HELP = {
     ↑ ↓    its volume (1 dB a press)
     a, space  hear the selected one of ours here too, or not: the amplifier (--monitor or --playback; headphones)
     u      --playback: pause the music, or play it on (as m for the microphone)
+    [ ]    the selected one's left, right channel off in what we send, or on again (--stereo): talk on the left,
+           music on the right
     n b    --playback: the next file of the music, the one before
     i      who, how long, muted, video codec
     x e q h  hang up
@@ -516,6 +518,21 @@ class SylkCall(object):
         except Exception as e:
             print(f'* cannot record: {e}')
 
+    def _toggle_channel(self, media, channel):
+        """[ ]: the selected strip's left or right channel off in what we send (in stereo), or on again."""
+        strip = self.mixer_control.selected_strip(media) if media is not None else None
+        if strip is None or not hasattr(media, 'toggle_strip_channel'):
+            print('* select a strip (← →) to turn its left ([) or right (]) channel off')
+            return
+        # ours: in what we send; one of what we hear: in what we hear of it
+        on = media.toggle_strip_channel(strip['key'] if strip['kind'] == 'send' else 'listen:' + strip['key'], channel)
+        if on is None:
+            print('* we send mono: start with --stereo to set the channels apart')
+        else:
+            print(f'* {strip["name"]}: the {("left", "right")[channel]} channel ' + ('on' if on else 'off'))
+        if self.panel is not None:
+            self._update_panel()
+
     # The status panel: the top 65% of the terminal, the console scrolling under it
 
     PANEL_FRACTION = 0.65
@@ -609,12 +626,13 @@ class SylkCall(object):
                 level = value(out, 'level') if strip['name'] == 'total' else self.statistics.strip_levels.get(strip['name'])
                 label, style = control.label(media, 'send', strip['name'], strip['name'], muted=strip['name'] == 'mic' and muted)
                 groups.append((label, vu_meters(level, channels), style,
-                               'PAUSED' if strip['name'] == 'music' and mixer.paused else None))     # over its meters
+                               'PAUSED' if strip['name'] == 'music' and mixer.paused else media.channels_caption(strip['name'])))     # over its meters
         else:
             label, style = control.label(media, 'send', 'mic', 'mic', muted=muted)
-            groups.append((label, vu_meters(value(out, 'level'), channels), style))
+            groups.append((label, vu_meters(value(out, 'level'), channels), style, media.channels_caption('mic') if media is not None else None))
         label, style = control.label(media, 'listen', 'remote', peer[:12])
-        groups += [GAP, (label, vu_meters(value(incoming, 'level'), channels), style)]
+        groups += [GAP, (label, vu_meters(value(incoming, 'level'), channels), style,
+                         media.channels_caption('listen:remote') if media is not None else None)]
         if media is not None:
             footer = DIM + '── ← → select · ↑ ↓ volume' + (' · u pause · n b next/back' if mixer is not None else '') + ' · 0-9 level · a/space hear it' + ('' if self.stereo else ' · k keypad') + ' · ? help · m mute · x e q h hang up ' + '─' * 400 + RESET
 
@@ -820,6 +838,8 @@ class SylkCall(object):
                 print('* ' + self.mixer_control.toggle_monitor(call.media))
                 if self.panel is not None:
                     self._update_panel()
+            elif key in '[]' and call.media is not None:
+                self._toggle_channel(call.media, 0 if key == '[' else 1)
             elif key == 'u' and getattr(call.media, 'send_mixer', None) is not None:
                 print('* music paused' if call.media.send_mixer.toggle_pause() else '* music on')
             elif key in ('n', 'b') and getattr(call.media, 'send_mixer', None) is not None:

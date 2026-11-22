@@ -499,9 +499,25 @@ def _send_audio(media, echo_cancellation, muted):
         log.warning(f'--playback: no audio files in {", ".join(media.playback)}: the microphone alone')
     if not files:
         media.send_mixer = None
-        return microphone + _level('miclevel') + _monitor_tee(media, 'mic') + [_make('tee', 'rec-sent', allow_not_linked=True)]
+        return microphone + _channel_switch(media, 'mic') + _level('miclevel') + _monitor_tee(media, 'mic') + [_make('tee', 'rec-sent', allow_not_linked=True)]
     media.send_mixer = SendMixer(media, files)
     return media.send_mixer.head(microphone) + [_make('tee', 'rec-sent', allow_not_linked=True)]      # what r records of what we send
+
+
+def _channel_switch(media, key, always=False):
+    """Stereo: each channel of strip key (mic, music, total) on or off ([ ] on the selected strip): audiopanorama's
+    simple method (its panorama changed as it plays: made for that, unlike audiomixmatrix's matrix, which crashes
+    changed while playing): +1 the left off, -1 the right, 0 both as they are; both off: a volume muted. [] in mono,
+    or without audiopanorama."""
+    switches = media.__dict__.setdefault('_channel_switches', {})
+    switches.pop(key, None)
+    if not (media.stereo or always) or not _has('audiopanorama'):      # always: what we hear (two channels in any case)
+        return []
+    name = re.sub(r'[^A-Za-z0-9_-]', '_', key)
+    switch = (_make('audiopanorama', 'channels-' + name, method='simple', panorama=0.0), _make('volume', 'channelsmute-' + name))
+    switches[key] = switch
+    media._set_channels(key)
+    return list(switch)
 
 
 def _attach_send_audio(media):
@@ -614,13 +630,13 @@ class SendMixer(object):
         """The elements from the mixer on (to what encodes), the microphone's kept to be linked into it."""
         channels = 2 if self.media.stereo else 1
         self._caps = Gst.Caps.from_string(f'audio/x-raw,rate=48000,channels={channels}')
-        self._microphone = microphone + [_make('capsfilter', caps=self._caps)] + _level('level-strip-mic') + _monitor_tee(self.media, 'mic')
+        self._microphone = microphone + [_make('capsfilter', caps=self._caps)] + _channel_switch(self.media, 'mic') + _level('level-strip-mic') + _monitor_tee(self.media, 'mic')
         self._music_volume = _make('volume', 'musicgain')
         self._music = [_make('queue', 'musicqueue', max_size_time=2 * Gst.SECOND), _make('audioconvert'), _make('audioresample'),
-                       _make('capsfilter', caps=self._caps), self._music_volume] + _level('level-strip-music') + _monitor_tee(self.media, 'music')
+                       _make('capsfilter', caps=self._caps)] + _channel_switch(self.media, 'music') + [self._music_volume] + _level('level-strip-music') + _monitor_tee(self.media, 'music')
         self.mixer = _make('audiomixer', 'sendmixer')
         self._master = _make('volume', 'mastergain')
-        return [self.mixer, _make('audioconvert'), _make('capsfilter', caps=self._caps), self._master] + _level('miclevel')
+        return [self.mixer, _make('audioconvert'), _make('capsfilter', caps=self._caps), self._master] + _channel_switch(self.media, 'total') + _level('miclevel')
 
     def attach(self):
         """Once the mixer is in the pipeline: the microphone and the music linked into it, the first file played."""
@@ -1012,6 +1028,35 @@ class _Strips(object):
             strip['monitor'] = on.get(strip['key'], False) if strip['key'] in monitors else None     # None: not to be heard here
         gains = self.__dict__.setdefault('listen_gains', {})
         return strips + [dict(kind='listen', key=key, name=name, gain=gains.get(key, 0.0), monitor=None) for key, name in self._listen()]
+
+    def _set_channels(self, key):
+        """Strip key's switch set to its channels (channels_on: key -> [left, right], kept for the next media)."""
+        on = self.__dict__.setdefault('channels_on', {}).setdefault(key, [True, True])
+        switch = self.__dict__.setdefault('_channel_switches', {}).get(key)
+        if switch is None:
+            return
+        pan, mute = switch
+        left, right = on
+        pan.set_property('panorama', 0.0 if left == right else 1.0 if right else -1.0)
+        mute.set_property('mute', not left and not right)
+
+    def toggle_strip_channel(self, key, channel):
+        """[ ]: strip key's left (0) or right (1) channel off in what we send, or on again: None when it cannot be
+        (mono, or a strip of what we hear)."""
+        if key not in self.__dict__.setdefault('_channel_switches', {}):
+            return None
+        on = self.__dict__.setdefault('channels_on', {}).setdefault(key, [True, True])
+        on[channel] = not on[channel]
+        self._set_channels(key)
+        log.info(f'{key}: the {("left", "right")[channel]} channel ' + ('on' if on[channel] else 'off'))
+        return on[channel]
+
+    def channels_caption(self, key):
+        """'L off', 'R off', 'L off R off' or None: strip key's channels, over its meters."""
+        on = self.__dict__.setdefault('channels_on', {}).get(key)
+        if key not in self.__dict__.setdefault('_channel_switches', {}) or on is None or all(on):
+            return None
+        return ' '.join(f'{name} off' for name, state in zip('LR', on) if not state)
 
     def set_strip_monitor(self, key, on):
         """Whether we hear strip key (mic, music) here too: False when it cannot be (no monitoring)."""
@@ -1411,6 +1456,7 @@ class RoomMedia(_Strips, _Recorder):
             tee = _make('tee', allow_not_linked=True)      # its own track (record_tracks), from here, whenever recorded
             chain += [tee, _make('queue')]
             participant.media['tee'] = tee
+            chain += _channel_switch(self, 'listen:' + participant.name, always=True)
             chain.append(self._listen_volume(participant.name, 'listen-' + participant.feed))
             if _has('level'):
                 chain.append(_make('level', 'level-' + participant.feed, interval=LEVEL_INTERVAL, post_messages=True))
@@ -2137,7 +2183,7 @@ class CallMedia(_Strips, _Recorder):
         if kind.startswith('audio/'):
             chain = [_make('queue', max_size_buffers=0, max_size_bytes=0, max_size_time=RECEIVED_AUDIO_QUEUE * Gst.SECOND, leaky='downstream'), _make('audioconvert'), _make('audioresample'),
                      _make('capsfilter', caps=Gst.Caps.from_string('audio/x-raw,rate=48000,channels=2'))]
-            chain += [self._listen_volume('remote', 'listen-remote')] + _level('level-remote')
+            chain += _channel_switch(self, 'listen:remote', always=True) + [self._listen_volume('remote', 'listen-remote')] + _level('level-remote')
             self._remote_channels = _channels(caps)
             playback = self._playback.get_static_pad('sink')
             if playback.is_linked():
